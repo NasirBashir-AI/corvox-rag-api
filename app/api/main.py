@@ -5,6 +5,15 @@ from app.generation.generator import generate_answer
 from app.api.schemas import SearchResponse, ChatRequest, ChatResponse, SearchHit
 from app.api.schemas import AnswerOut
 
+from app.api.schemas import (
+    SearchResponse,
+    ChatResponse,
+    SearchHit,
+    AnswerOut,
+    ChatRequest,
+    QuestionIn,   # ✅ add this
+)
+
 @app.post("/answer", response_model=AnswerOut)
 def answer(req: QuestionIn):
     out = generate_answer(req.question, k=req.k)
