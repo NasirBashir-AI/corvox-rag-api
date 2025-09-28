@@ -1,0 +1,17 @@
+# Python / venv
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# zips / build artifacts
+*.zip
+
+# editor
+.vscode/
+.idea/
+
+# env files (never commit secrets)
+.env

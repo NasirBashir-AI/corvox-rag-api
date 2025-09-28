@@ -1,0 +1,8 @@
+psycopg2-binary>=2.9
+openai>=1.0.0
+httpx>=0.24
+anyio>=4.0
+tiktoken>=0.5
+pydantic>=2.0
+fastapi>=0.110
+uvicorn[standard]>=0.27
