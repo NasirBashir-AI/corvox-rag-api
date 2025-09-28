@@ -1,6 +1,16 @@
 from __future__ import annotations
 from pydantic import BaseModel
 from typing import List, Optional, Any
+from typing import Optional, List
+
+class Citation(BaseModel):
+    title: str
+    chunk_no: int
+
+class AnswerOut(BaseModel):
+    answer: str
+    citations: Optional[List[Citation]] = None  # omitted by default
+    # debug: Optional[dict] = None              # keep if you expose a debug endpoint
 
 class SearchHit(BaseModel):
     doc_id: int

@@ -20,3 +20,9 @@ CHAT_MODEL      = "gpt-4o-mini"              # used by generator
 # --- Chunking defaults (shared by ingest/retrieval) ---
 CHUNK_SIZE     = 500
 CHUNK_OVERLAP  = 50
+
+# existing imports & settings...
+
+# Feature flags
+SHOW_CITATIONS = False      # <- production default: no citations in responses
+DEBUG_RAG = False           # <- production default: no retrieval dump in responses

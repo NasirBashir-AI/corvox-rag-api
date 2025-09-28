@@ -3,6 +3,12 @@ from fastapi import FastAPI, Query
 from app.retrieval.retriever import search
 from app.generation.generator import generate_answer
 from app.api.schemas import SearchResponse, ChatRequest, ChatResponse, SearchHit
+from app.api.schemas import AnswerOut
+
+@app.post("/answer", response_model=AnswerOut)
+def answer(req: QuestionIn):
+    out = generate_answer(req.question, k=req.k)
+    return AnswerOut(answer=out["answer"], citations=out.get("citations"))
 
 app = FastAPI(title="Corah API", version="0.1.0")
 
