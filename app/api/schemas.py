@@ -60,6 +60,12 @@ class LeadOut(BaseModel):
     missing: List[str] = []
     lead_id: Optional[int] = None
 
+class ChatRequest(BaseModel):
+    session_id: Optional[str] = None
+    question: str
+    k: int = 5
+    max_context: int = 3000
+
 # -----------------------------
 # Lead Capture – validated payload
 # (useful for saving a complete/partial lead)

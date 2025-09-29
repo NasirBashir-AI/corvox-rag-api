@@ -6,11 +6,7 @@ import os
 
 import psycopg2
 from fastapi import FastAPI, Query
-from app.api.schemas import (
-    QuestionIn, AnswerOut, SearchResponse,
-    ChatRequest, ChatResponse,
-    LeadStart, LeadMessageIn, LeadOut, Lead,
-)
+from app.api.schemas import QuestionIn, AnswerOut, SearchResponse, ChatRequest, LeadStart, LeadMessageIn, LeadOut, Lead
 from app.retrieval.retriever import search
 from app.generation.generator import generate_answer
 from app.core.config import DB_URL  # postgresql://... from your config/env
@@ -97,9 +93,9 @@ def answer(req: QuestionIn):
 # -----------------------------
 # Chat (keeps rewritten/used internally; returns only answer)
 # -----------------------------
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat", response_model=AnswerOut)
 def chat_endpoint(payload: ChatRequest):
-    # attach short-term memory if provided
+    # short-term session memory (safe no-op if not provided)
     st = session(payload.session_id)
     if st:
         st["history"].append({"role": "user", "content": payload.question})
@@ -109,15 +105,12 @@ def chat_endpoint(payload: ChatRequest):
         k=payload.k,
         max_context_chars=payload.max_context,
     )
-    # keep internals for diagnostics if needed
-    rewritten = out.get("rewritten_query")
-    used = out.get("used", [])
 
     if st:
         st["history"].append({"role": "assistant", "content": out["answer"]})
 
-    # Return only the customer-facing piece (others are optional → hidden)
-    return ChatResponse(answer=out["answer"], rewritten_query=rewritten, used=used)
+    # Return ONLY the answer (keeps FastAPI validation simple & avoids 500s)
+    return AnswerOut(answer=out["answer"])
 
 # =============================
 # Lead Capture (natural, progressive)
