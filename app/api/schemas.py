@@ -1,7 +1,7 @@
 # app/api/schemas.py
 from __future__ import annotations
 from typing import List, Optional
-from pydantic import BaseModel, EmailStr, constr
+from pydantic import BaseModel, EmailStr, Field
 
 # -----------------------------
 # Search / Retrieval
@@ -34,7 +34,7 @@ class ChatRequest(BaseModel):
     k: int = 5
     max_context: int = 3000
     session_id: Optional[str] = None  # <-- add this
-    
+
 class AnswerOut(BaseModel):
     answer: str
 
@@ -68,7 +68,7 @@ class LeadOut(BaseModel):
 class Lead(BaseModel):
     name: Optional[str] = None
     email: Optional[EmailStr] = None
-    phone: Optional[constr(regex=r'^[\d+\-\s]{7,20}$')] = None  # flexible phone validation
+    phone: Optional[str] = Field(None, regex=r'^[\d+\-\s]{7,20}$')  # flexible phone validation
     company_name: Optional[str] = None
     company_size: Optional[str] = None
     industry: Optional[str] = None
