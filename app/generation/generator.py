@@ -1,3 +1,4 @@
+# app/generation/generator.py
 from __future__ import annotations
 from typing import Dict, Any, List
 from openai import OpenAI
@@ -6,6 +7,30 @@ from app.retrieval.retriever import search, make_context
 from app.core.config import SHOW_CITATIONS, DEBUG_RAG
 
 client = OpenAI()  # uses OPENAI_API_KEY from env
+
+# ---------- Self-query rewrite ----------
+SELF_QUERY_SYSTEM = """You are a retrieval query optimizer.
+Rewrite the user's question to maximize retrieval recall and precision.
+- Expand important terms with synonyms.
+- Keep it concise (<= 40 tokens).
+- No answers, just a better search query.
+- Plain text only.
+"""
+
+def self_query_rewrite(user_question: str) -> str:
+    q = user_question.strip()
+    if not q:
+        return q
+    rsp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": SELF_QUERY_SYSTEM},
+            {"role": "user", "content": q},
+        ],
+        temperature=0.2,
+        max_tokens=80,
+    )
+    return rsp.choices[0].message.content.strip()
 
 # ---------- Answer synthesis (grounded RAG) ----------
 
@@ -36,19 +61,22 @@ def generate_answer(
     debug = DEBUG_RAG if debug is None else debug
     show_citations = SHOW_CITATIONS if show_citations is None else show_citations
 
-    # 1) self-query rewrite (keep as you already have it, or remove if not used)
-    # rewritten = self_query_rewrite(question) if question.strip() else question
-    rewritten = question.strip()
+    # 1) self-query rewrite
+    rewritten = self_query_rewrite(question)
 
-    # 2) retrieve
+    # 2) retrieve using the rewritten query
     hits = search(rewritten, k=k)
 
     # 3) context
     context, used = make_context(hits, max_chars=max_context_chars)
     if not context.strip():
-        base = {"answer": "I don’t have that information yet."}
+        base = {
+            "answer": "I don’t have that information yet.",
+            "rewritten_query": rewritten,
+            "used": [],
+        }
         if debug:
-            base["debug"] = {"rewritten_query": rewritten, "used": used}
+            base["debug"] = {"rewritten_query": rewritten, "used": []}
         return base
 
     # 4) call LLM
@@ -62,17 +90,21 @@ def generate_answer(
     answer = rsp.choices[0].message.content.strip()
 
     # 5) construct response
-    out: Dict[str, Any] = {"answer": answer}
+    out: Dict[str, Any] = {
+        "answer": answer,
+        "rewritten_query": rewritten,  # <-- top-level for main.py
+        "used": used,                  # <-- top-level for main.py
+    }
 
-    # if you *do* want lightweight citations sometimes
+    # optional lightweight citations list
     if show_citations:
         out["citations"] = [{"title": u["title"], "chunk_no": u["chunk_no"]} for u in used]
 
-    # debug only when explicitly requested or feature-flagged
+    # debug bundle
     if debug:
         out.setdefault("debug", {})
         out["debug"]["rewritten_query"] = rewritten
-        out["debug"]["used"] = used  # full objects with uri/similarity, etc.
+        out["debug"]["used"] = used
 
     return out
 
