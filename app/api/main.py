@@ -16,6 +16,7 @@ from app.generation.generator import generate_answer
 from app.core.config import DB_URL  # postgresql://... from your config/env
 from openai import OpenAI
 import json
+from fastapi.middleware.cors import CORSMiddleware
 
 client = OpenAI()  # uses OPENAI_API_KEY
 USE_LLM_LEAD_SUMMARY = os.getenv("USE_LLM_LEAD_SUMMARY", "1") == "1"
@@ -23,6 +24,15 @@ LEAD_SUMMARY_MODEL = os.getenv("LEAD_SUMMARY_MODEL", "gpt-4o-mini")
 
 
 app = FastAPI(title="Corah API", version="1.0.0")
+
+# Allow browser apps (temporary wide-open while we test)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],       # later we can restrict to your domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -----------------------------
 # In-memory session store (short-term)
