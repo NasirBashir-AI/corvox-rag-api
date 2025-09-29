@@ -68,7 +68,7 @@ class LeadOut(BaseModel):
 class Lead(BaseModel):
     name: Optional[str] = None
     email: Optional[EmailStr] = None
-    phone: Optional[str] = Field(None, regex=r'^[\d+\-\s]{7,20}$')  # flexible phone validation
+    phone: Optional[constr(pattern=r'^[\d+\-\s]{7,20}$')] = None # flexible phone validation
     company_name: Optional[str] = None
     company_size: Optional[str] = None
     industry: Optional[str] = None
