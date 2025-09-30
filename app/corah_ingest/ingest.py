@@ -1,8 +1,6 @@
 # ingest.py
 import os
 from openai import OpenAI
-from config import RAW_DOCS_PATH, EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP
-from db_utils import get_connection, insert_document, insert_chunks
 
 from app.core.config import (
     RAW_DOCS_PATH,
