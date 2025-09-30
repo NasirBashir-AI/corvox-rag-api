@@ -7,17 +7,18 @@ def get_connection():
 
 def insert_document(cur, source, uri, title=None):
     cur.execute(
-        "INSERT INTO corah_store.documents (source, uri, title) VALUES (%s, %s, %s) RETURNING id",
-        ("local", uri, title),
+    "INSERT INTO corah_store.documents (source, uri, title) VALUES (%s, %s, %s) RETURNING id",
+    (source, uri, title),
     )
     return cur.fetchone()[0]
 
-def insert_chunks(cur, doc_id, chunks_with_embeddings):
+def insert_chunks(cur, rows):
     execute_values(
         cur,
         """
-        INSERT INTO corah_store.chunks (doc_id, chunk_no, content, embedding, token_count)
+        INSERT INTO corah_store.chunks
+            (doc_id, chunk_no, content, embedding, token_count)
         VALUES %s
         """,
-        chunks_with_embeddings,
+        rows,
     )
