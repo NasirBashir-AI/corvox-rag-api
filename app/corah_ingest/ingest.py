@@ -39,7 +39,7 @@ def ingest_file(path):
     embeddings = embed_texts(chunks)
     conn = get_connection()
     cur = conn.cursor()
-    doc_id = insert_document(cur, uri=path, title=os.path.basename(path))
+    doc_id = insert_document(cur, source="raw", uri=path, title=os.path.basename(path))
     rows = [(doc_id, i, c, e, len(c.split())) for i, (c, e) in enumerate(zip(chunks, embeddings), start=1)]
     insert_chunks(cur, doc_id, rows)
     conn.commit()
