@@ -11,7 +11,7 @@ FALLBACK_DB_URL = "postgresql://corah_user:YOUR_PASSWORD@localhost:5432/corah"
 
 # --- Files / paths (adjust as you like for local dev) ---
 # For local Mac dev you can point this to your Knowledge/ folder if you want
-RAW_DOCS_PATH = "./Knowledge"
+RAW_DOCS_PATH = os.getenv("RAW_DOCS_PATH", "/home/ec2-user/corah/data/raw")
 
 # --- Models (central place so all code imports from here) ---
 EMBEDDING_MODEL = "text-embedding-3-small"   # 1536-dim, matches pgvector(1536)
