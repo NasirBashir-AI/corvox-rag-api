@@ -1,37 +1,39 @@
 # app/api/main.py
 from __future__ import annotations
 from typing import Dict, Any, Optional, List
-import re
 import os
+import re
+import json
 
 import psycopg2
-from fastapi import FastAPI, Query
-from app.api.schemas import QuestionIn, AnswerOut, SearchResponse, ChatRequest, LeadStart, LeadMessageIn, LeadOut, Lead
+from fastapi import FastAPI, APIRouter, Query
+from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
+
+from app.api.schemas import (
+    QuestionIn, AnswerOut, SearchResponse,
+    ChatRequest, ChatResponse,
+    LeadStart, LeadMessageIn, LeadOut, Lead,
+)
 from app.retrieval.retriever import search
 from app.generation.generator import generate_answer
-from app.core.config import DB_URL  # postgresql://... from your config/env
-from openai import OpenAI
-import json
-from fastapi.middleware.cors import CORSMiddleware
+from app.core.config import DB_URL
 
-client = OpenAI()  # uses OPENAI_API_KEY
-USE_LLM_LEAD_SUMMARY = os.getenv("USE_LLM_LEAD_SUMMARY", "1") == "1"
-LEAD_SUMMARY_MODEL = os.getenv("LEAD_SUMMARY_MODEL", "gpt-4o-mini")
-
-
+# -----------------------------
+# FastAPI app + CORS
+# -----------------------------
 app = FastAPI(title="Corah API", version="1.0.0")
-
-# Allow browser apps (temporary wide-open while we test)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # later we can restrict to your domain
+    allow_origins=["*"],  # tighten later to your domain(s)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+api = APIRouter(prefix="/api")
 
 # -----------------------------
-# In-memory session store (short-term)
+# In-memory session store
 # -----------------------------
 SESSIONS: Dict[str, Dict[str, Any]] = {}  # { session_id: {history:[], lead:{...}} }
 
@@ -43,41 +45,22 @@ def session(sid: Optional[str]) -> Dict[str, Any]:
     return SESSIONS[sid]
 
 # -----------------------------
-# Helpers: DB upsert for leads
-# -----------------------------
-def upsert_lead(lead: Dict[str, Any]) -> int:
-    """
-    Upsert into leads table. Returns lead id.
-    lead keys allowed: name,email,phone,company_name,company_size,industry,requirements,goals,lead_summary
-    """
-    fields = [
-        "name","email","phone","company_name","company_size",
-        "industry","requirements","goals","lead_summary"
-    ]
-    vals = [lead.get(k) for k in fields]
-    with psycopg2.connect(DB_URL) as cx, cx.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO leads (name,email,phone,company_name,company_size,industry,requirements,goals,lead_summary)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            RETURNING id
-            """,
-            vals
-        )
-        lead_id = cur.fetchone()[0]
-        return lead_id
-
-# -----------------------------
 # Health
 # -----------------------------
-@app.get("/health")
+@api.get("/health")
 def health():
+    # Optionally test DB connectivity quickly (commented to stay fast)
+    # try:
+    #     with psycopg2.connect(DB_URL) as cx, cx.cursor() as cur:
+    #         cur.execute("SELECT 1")
+    # except Exception as e:
+    #     return {"ok": False, "db": False, "err": str(e)}
     return {"ok": True}
 
 # -----------------------------
-# Search (dev tool)
+# Search (dev utility)
 # -----------------------------
-@app.get("/search", response_model=SearchResponse)
+@api.get("/search", response_model=SearchResponse)
 def search_endpoint(q: str = Query(..., min_length=2), k: int = 5):
     hits = search(q, k=k)
     return {"query": q, "k": k, "hits": hits}
@@ -85,17 +68,16 @@ def search_endpoint(q: str = Query(..., min_length=2), k: int = 5):
 # -----------------------------
 # Answer (prod surface: answer-only)
 # -----------------------------
-@app.post("/answer", response_model=AnswerOut)
+@api.post("/answer", response_model=AnswerOut)
 def answer(req: QuestionIn):
     out = generate_answer(req.question, k=req.k)
     return AnswerOut(answer=out["answer"])
 
 # -----------------------------
-# Chat (keeps rewritten/used internally; returns only answer)
+# Chat (uses generator: self-query + similarity gate + temp memory)
 # -----------------------------
-@app.post("/chat", response_model=AnswerOut)
+@api.post("/chat", response_model=ChatResponse)
 def chat_endpoint(payload: ChatRequest):
-    # short-term session memory (safe no-op if not provided)
     st = session(payload.session_id)
     if st:
         st["history"].append({"role": "user", "content": payload.question})
@@ -109,8 +91,12 @@ def chat_endpoint(payload: ChatRequest):
     if st:
         st["history"].append({"role": "assistant", "content": out["answer"]})
 
-    # Return ONLY the answer (keeps FastAPI validation simple & avoids 500s)
-    return AnswerOut(answer=out["answer"])
+    # We keep rewritten_query/used available (UI can ignore/hide in prod)
+    return ChatResponse(
+        answer=out["answer"],
+        rewritten_query=out.get("rewritten_query"),
+        used=out.get("used"),
+    )
 
 # =============================
 # Lead Capture (natural, progressive)
@@ -128,6 +114,7 @@ LEAD_ORDER = [
     "industry",
     "requirements",
     "goals",
+    "role",  # added to identify decision-maker/influencer/staff
 ]
 
 PROMPTS = {
@@ -139,6 +126,7 @@ PROMPTS = {
     "industry": "Which industry are you in?",
     "requirements": "What do you want us to build or solve for you?",
     "goals": "What’s the main goal or outcome you want to achieve?",
+    "role": "What’s your role in the company (e.g., owner, manager, developer)?",
 }
 
 def valid(field: str, val: str) -> bool:
@@ -149,25 +137,25 @@ def valid(field: str, val: str) -> bool:
     return bool(val.strip())
 
 def next_missing(lead: Dict[str, Any]) -> List[str]:
-    missing = [f for f in LEAD_ORDER if not lead.get(f)]
-    return missing
+    return [f for f in LEAD_ORDER if not lead.get(f)]
 
-def summarize_lead(lead: Dict[str, Any]) -> str:
-    # lightweight summary (can be replaced by LLM later)
+# ---- Lead summary (LLM, toggleable) ----
+client = OpenAI()  # uses OPENAI_API_KEY
+USE_LLM_LEAD_SUMMARY = os.getenv("USE_LLM_LEAD_SUMMARY", "1") == "1"
+LEAD_SUMMARY_MODEL = os.getenv("LEAD_SUMMARY_MODEL", "gpt-4o-mini")
+
+def summarize_lead_rule_based(lead: Dict[str, Any]) -> str:
     parts = []
     if lead.get("name"): parts.append(f"Lead: {lead['name']}")
     if lead.get("company_name"): parts.append(f"Company: {lead['company_name']}")
     if lead.get("company_size"): parts.append(f"Size: {lead['company_size']}")
     if lead.get("industry"): parts.append(f"Industry: {lead['industry']}")
+    if lead.get("role"): parts.append(f"Role: {lead['role']}")
     if lead.get("requirements"): parts.append(f"Requirements: {lead['requirements']}")
     if lead.get("goals"): parts.append(f"Goals: {lead['goals']}")
     return " | ".join(parts) or "Lead captured."
 
-def generate_lead_summary_llm(lead: Dict[str, Any]) -> str:
-    """
-    Polished sales-ready lead report via LLM.
-    Falls back to rule-based summary on any error.
-    """
+def summarize_lead_llm(lead: Dict[str, Any]) -> str:
     try:
         sys = (
             "You are Corah, a concise pre-sales assistant. "
@@ -176,7 +164,7 @@ def generate_lead_summary_llm(lead: Dict[str, Any]) -> str:
         )
         user = (
             "Create a crisp lead report (4–6 lines) covering: person, company, size/industry, "
-            "what they want (requirements), their main goal, and a 1-line recommendation.\n\n"
+            "their role, what they want (requirements), their main goal, and a 1-line recommendation.\n\n"
             f"Lead JSON:\n{json.dumps(lead, ensure_ascii=False)}"
         )
         rsp = client.chat.completions.create(
@@ -188,10 +176,36 @@ def generate_lead_summary_llm(lead: Dict[str, Any]) -> str:
         )
         return rsp.choices[0].message.content.strip()
     except Exception:
-        # No hard failure: fall back to the free rule-based summary
-        return summarize_lead(lead)
+        return summarize_lead_rule_based(lead)
 
-@app.post("/lead/start", response_model=LeadOut)
+def build_lead_summary(lead: Dict[str, Any]) -> str:
+    return summarize_lead_llm(lead) if USE_LLM_LEAD_SUMMARY else summarize_lead_rule_based(lead)
+
+# ---- DB upsert for leads ----
+def upsert_lead(lead: Dict[str, Any]) -> int:
+    """
+    Insert a lead row. Returns lead id.
+    Columns expected: name,email,phone,company_name,company_size,industry,requirements,goals,role,lead_summary
+    """
+    fields = [
+        "name","email","phone","company_name","company_size",
+        "industry","requirements","goals","role","lead_summary"
+    ]
+    vals = [lead.get(k) for k in fields]
+    with psycopg2.connect(DB_URL) as cx, cx.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.leads
+                (name,email,phone,company_name,company_size,industry,requirements,goals,role,lead_summary)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id;
+            """,
+            vals
+        )
+        lead_id = cur.fetchone()[0]
+        return int(lead_id)
+
+@api.post("/lead/start", response_model=LeadOut)
 def lead_start(payload: LeadStart):
     st = session(payload.session_id)
     st["lead"] = st.get("lead", {})
@@ -201,26 +215,24 @@ def lead_start(payload: LeadStart):
             "I already have your details. Would you like to add anything else?"
     return LeadOut(reply=reply, done=not bool(missing), missing=missing)
 
-@app.post("/lead/message", response_model=LeadOut)
+@api.post("/lead/message", response_model=LeadOut)
 def lead_message(payload: LeadMessageIn):
     st = session(payload.session_id)
     st["lead"] = st.get("lead", {})
     user_text = payload.message.strip()
 
-    # try to intelligently map free text to the next missing field
     missing = next_missing(st["lead"])
     if not missing:
-        # already done → confirm and return
-        summary = generate_lead_summary_llm(st["lead"]) if USE_LLM_LEAD_SUMMARY else summarize_lead(st["lead"])
-        st["lead"]["lead_summary"] = summary
+        # already complete → ensure saved
+        if "lead_summary" not in st["lead"]:
+            st["lead"]["lead_summary"] = build_lead_summary(st["lead"])
         lead_id = upsert_lead(st["lead"])
         return LeadOut(reply="Thanks — I’ve got everything I need. Our team will reach out shortly.",
                        done=True, missing=[], lead_id=lead_id)
 
     field = missing[0]
-
-    # basic validation / extraction
     val = user_text
+
     if field == "email":
         m = EMAIL_RX.search(user_text)
         if not m:
@@ -234,12 +246,10 @@ def lead_message(payload: LeadMessageIn):
 
     st["lead"][field] = val
 
-    # check next step
+    # next prompt or finish
     missing = next_missing(st["lead"])
     if not missing:
-        # finalize → create summary + save to DB
-        summary = generate_lead_summary_llm(st["lead"]) if USE_LLM_LEAD_SUMMARY else summarize_lead(st["lead"])
-        st["lead"]["lead_summary"] = summary
+        st["lead"]["lead_summary"] = build_lead_summary(st["lead"])
         lead_id = upsert_lead(st["lead"])
         return LeadOut(reply="Perfect — captured everything. Our team will contact you soon.",
                        done=True, missing=[], lead_id=lead_id)
@@ -247,3 +257,6 @@ def lead_message(payload: LeadMessageIn):
     nxt = missing[0]
     return LeadOut(reply=PROMPTS.get(nxt, f"Please provide your {nxt.replace('_',' ')}."),
                    done=False, missing=missing)
+
+# Mount router
+app.include_router(api)

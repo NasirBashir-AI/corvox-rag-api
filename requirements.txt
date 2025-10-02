@@ -1,8 +1,20 @@
-psycopg2-binary>=2.9
+# Core dependencies
 openai>=1.0.0
-httpx>=0.24
-anyio>=4.0
+psycopg2-binary>=2.9
+pydantic<2
+fastapi>=0.115
+uvicorn>=0.37
+starlette>=0.40
+requests>=2.26.0
+python-dotenv>=1.0
+click>=8.0
+
+# Optional but used in retriever & API server
+httptools>=0.6
+uvloop>=0.21
+watchfiles>=1.1
+websockets>=15.0
+
+# Token counting / text utils
 tiktoken>=0.5
-pydantic>=2.0
-fastapi>=0.110
-uvicorn[standard]>=0.27
+anyio>=4.0

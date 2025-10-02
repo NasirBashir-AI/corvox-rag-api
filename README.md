@@ -1,53 +1,22 @@
-# Corah RAG API
+# Corah – Conversational AI Assistant (Backend)
 
-Corah is a **Retrieval-Augmented Generation (RAG) chatbot framework** built by **Corvox**.  
-It combines document ingestion, semantic search, and grounded answer generation into a clean API.
-
----
-
-## 🚀 Features
-- **Ingestion**: Load and chunk Markdown/text docs, store in PostgreSQL with pgvector.  
-- **Retrieval**: Semantic search with embeddings and top-k chunk selection.  
-- **Generation**: GPT-powered answers, grounded only in retrieved context.  
-- **Self-query Rewriting**: LLM rewrites user queries for better recall & precision.  
-- **API Layer**: Expose endpoints for chatbots or web UIs.  
+Corah is a FastAPI backend that uses OpenAI + Postgres to answer questions from your knowledge base and capture leads with a natural, sales-aware flow.
 
 ---
 
-## 📂 Project Structure
-
-app/
-api/           # FastAPI app (main.py, schemas.py)
-corah_ingest/  # Data ingestion (db_utils.py, ingest.py)
-generation/    # Answer generation (generator.py, prompt.py)
-retrieval/     # Semantic search & retrieval (retriever.py)
-requirements.txt # Python dependencies
-README.md        # Project documentation
-
----
-
-## 🛠️ Requirements
-
-- Python **3.10+**
-- PostgreSQL (with **pgvector** extension enabled)
-- OpenAI API key (set in environment variable)
-
-Install dependencies:
+## Quick Start (EC2 or local)
 
 ```bash
+# 1) Create and activate venv
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 2) Install deps
 pip install -r requirements.txt
 
-## ⚙️ Environment Setup
+# 3) Set environment (see next section), then:
+# Ingest your KB (rebuild = wipe & re-embed)
+python -m app.corah_ingest.ingest --db "$DB_URL" --root "$RAW_DOCS_PATH" --rebuild
 
-export POSTGRES_URL="postgresql://corah_user:YOUR_PASSWORD@localhost:5432/corah"
-export OPENAI_API_KEY="sk-xxxxx"
-
----
-
-## ▶️ Usage
-
-### 1. Ingest documents
-Load and store Markdown files into PostgreSQL:
-
-```bash
-python -m app.corah_ingest.ingest
+# 4) Run API
+uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --reload

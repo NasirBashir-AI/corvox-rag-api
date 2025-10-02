@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Corah • Corvox</title>
+  <style>
+    :root{
+      --bg:#0f141b;
+      --panel:#131a22;
+      --text:#e6edf3;
+      --muted:#9aa4af;
+      --accent:#8ab4ff;
+      --bot:#1e2631;
+      --user:#22324a;
+      --ring:#2f3b4a;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0; background:var(--bg); color:var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji","Segoe UI Emoji";
+      display:flex; justify-content:center; padding:24px;
+    }
+    .app{width:min(960px,95vw)}
+    header{display:flex; align-items:center; gap:16px; margin-bottom:16px}
+    .avatar{
+      width:56px; height:56px; border-radius:50%;
+      display:grid; place-items:center; background:#2a3a52; color:#cfe3ff;
+      font-weight:700;
+      border:1px solid var(--ring);
+    }
+    h1{margin:0; font-size:28px}
+    .sub{margin:2px 0 0; color:var(--muted); font-size:14px}
+    .chat{
+      background:var(--panel); border:1px solid var(--ring);
+      border-radius:14px; padding:16px; height:68vh; min-height:460px;
+      display:flex; flex-direction:column; gap:12px; overflow:auto;
+      scroll-behavior:smooth;
+    }
+    .bubble{
+      max-width:78%; padding:12px 14px; border-radius:12px;
+      box-shadow: 0 1px 0 rgba(0,0,0,.25);
+      line-height:1.35; white-space:pre-wrap; word-wrap:break-word;
+      border:1px solid var(--ring);
+    }
+    .bot{background:var(--bot)}
+    .user{background:var(--user); margin-left:auto}
+    .typing{display:inline-flex; gap:6px; align-items:center}
+    .dot{width:7px; height:7px; border-radius:50%; background:#9fb3cc; opacity:.4; animation:td 1.2s infinite}
+    .dot:nth-child(2){animation-delay:.15s}
+    .dot:nth-child(3){animation-delay:.3s}
+    @keyframes td{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-4px)}}
+
+    .composer{
+      display:flex; gap:10px; margin-top:14px;
+      background:var(--panel); border:1px solid var(--ring);
+      padding:10px; border-radius:12px;
+    }
+    input[type="text"]{
+      flex:1; background:#0f1520; color:var(--text); border:1px solid var(--ring);
+      padding:12px 12px; border-radius:10px; outline:none;
+    }
+    input::placeholder{color:#8994a1}
+    button{
+      background:var(--accent); color:#0d1220; border:0;
+      padding:12px 16px; border-radius:10px;
+      font-weight:700; cursor:pointer;
+    }
+    button[disabled]{opacity:.6; cursor:not-allowed}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="avatar">CO</div>
+      <div>
+        <h1>Corah</h1>
+        <div class="sub">Your AI assistant at Corvox</div>
+      </div>
+    </header>
+
+    <main class="chat" id="messages"></main>
+
+    <form id="chat-form" class="composer" autocomplete="off">
+      <input id="chat-input" type="text" placeholder="Ask anything — or type ‘start’ to begin…" autocomplete="off" />
+      <button type="submit" id="send-btn">Send</button>
+    </form>
+  </div>
+
+  <script>
+    // ==== CONFIG ====
+    const API_BASE_URL = "http://44.208.12.236:8001";
+
+    // ==== SESSION ====
+    const sessionId =
+      (typeof crypto !== "undefined" && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : 'sess-' + Math.random().toString(36).slice(2) + Date.now();
+
+    // ==== ELEMENTS ====
+    const messagesEl = document.getElementById('messages');
+    const form = document.getElementById('chat-form');
+    const input = document.getElementById('chat-input');
+    const sendBtn = document.getElementById('send-btn');
+
+    // ==== STATE ====
+    let leadMode = false;         // true when inside lead capture
+    let blocking = false;         // prevent double submits
+    let lastLeadPrompt = null;    // remembers last prompt so we can resume
+    // Show a greeting bubble at top
+    addBubble(
+      "Welcome! I’m Corah — your AI assistant at Corvox. Ask me anything about our AI services — or say “start” and I’ll collect your details.",
+      "bot"
+    );
+
+    // ==== UI HELPERS ====
+    function addBubble(text, who='bot'){
+      const div = document.createElement('div');
+      div.className = `bubble ${who}`;
+      div.textContent = text;
+      messagesEl.appendChild(div);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return div;
+    }
+    function addTyping(){
+      const div = document.createElement('div');
+      div.className = 'bubble bot';
+      div.innerHTML = `<span class="typing"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span>`;
+      messagesEl.appendChild(div);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return { remove(){ div.remove(); } };
+    }
+    async function postJSON(path, body){
+      const rsp = await fetch(`${API_BASE_URL}/${path}`, {
+        method:'POST',
+        headers:{'content-type':'application/json'},
+        body: JSON.stringify(body),
+        // credentials aren't needed when S3 static site -> EC2 public API
+      });
+      if(!rsp.ok){
+        const t = await rsp.text().catch(()=> '');
+        throw new Error(`HTTP ${rsp.status} ${rsp.statusText}: ${t}`);
+      }
+      return rsp.json();
+    }
+
+    // ==== QUESTION DETECTOR ====
+    function isLikelyQuestion(t){
+      const s = (t||'').trim();
+      return /[?]\s*$/.test(s) ||
+        /^(what|how|why|which|who|when|do|does|can|could|should|price|pricing|cost|services?|offer|capabilit|feature|support|integrat|deploy|host|security|compliance)/i
+        .test(s);
+    }
+
+    // ==== FLOWS ====
+    async function leadStart(){
+      const typing = addTyping();
+      try {
+        const out = await postJSON('lead/start', { session_id: sessionId });
+        typing.remove();
+        addBubble(out.reply, 'bot');
+        lastLeadPrompt = out.reply || null;
+        leadMode = !out.done;
+      } catch (e) {
+        typing.remove();
+        addBubble('Sorry — I had trouble starting the form. Please try again.', 'bot');
+        console.error(e);
+      }
+    }
+
+    async function leadMessage(text){
+      const typing = addTyping();
+      try {
+        const out = await postJSON('lead/message', { session_id: sessionId, message: text });
+        typing.remove();
+        addBubble(out.reply, 'bot');
+        lastLeadPrompt = out.reply || null;
+        if (out.done) {
+          leadMode = false;
+          if (out.lead_id) {
+            addBubble('Thanks — captured everything. A human will follow up shortly. You can keep asking questions in the meantime.', 'bot');
+          }
+        }
+      } catch (e) {
+        typing.remove();
+        addBubble('Sorry — something went wrong. Please try again.', 'bot');
+        console.error(e);
+      }
+    }
+
+    async function chatMessage(text){
+      const typing = addTyping();
+      try {
+        const out = await postJSON('chat', {
+          session_id: sessionId,
+          question: text,
+          k: 3,
+          max_context: 2000
+        });
+        typing.remove();
+        addBubble(out.answer || 'I don’t have that information yet.', 'bot');
+      } catch (e) {
+        typing.remove();
+        addBubble('Sorry — I couldn’t get an answer just now. Please try again.', 'bot');
+        console.error(e);
+      }
+    }
+
+    // ==== ROUTER ====
+    form.addEventListener('submit', async (ev)=>{
+      ev.preventDefault();
+      if (blocking) return;
+
+      const text = input.value.trim();
+      if (!text) return;
+
+      addBubble(text, 'user');
+      input.value = '';
+      blocking = true; sendBtn.setAttribute('disabled','');
+
+      try {
+        // begin lead flow
+        if (!leadMode && /^(start|let'?s talk|let us talk)$/i.test(text)) {
+          await leadStart();
+        }
+        // in lead flow + user asks a question -> answer then resume prompt
+        else if (leadMode && isLikelyQuestion(text)) {
+          await chatMessage(text);
+          if (lastLeadPrompt) addBubble(lastLeadPrompt, 'bot');
+        }
+        // in lead flow providing info
+        else if (leadMode) {
+          await leadMessage(text);
+        }
+        // normal Q&A
+        else {
+          await chatMessage(text);
+        }
+      } finally {
+        blocking = false; sendBtn.removeAttribute('disabled');
+      }
+    });
+  </script>
+</body>
+</html>

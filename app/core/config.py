@@ -1,28 +1,83 @@
 # app/core/config.py
+"""
+Central config for Corah.
+- Reads from environment first (so /etc/environment on EC2 wins)
+- Falls back to sensible defaults for local dev
+"""
+
+from __future__ import annotations
 import os
 
-# --- DB URL (read from env; optional local fallback) ---
-DB_URL = (
-    os.getenv("POSTGRES_URL")
-    or os.getenv("DATABASE_URL")
+# ---------- helpers ----------
+def _get_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _get_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+def _get_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+# ---------- core services ----------
+# OpenAI API key is read implicitly by the OpenAI SDK from the environment:
+#   export OPENAI_API_KEY=sk-...
+# No need to duplicate it here.
+
+# Postgres connection (prefer DB_URL if provided)
+DB_URL = os.getenv(
+    "DB_URL",
+    # local/dev default; override in /etc/environment on EC2 with your RDS URL
+    "postgresql://corah_user:password@127.0.0.1:5432/corah"
 )
-# Optional local fallback (only used if neither env var is set)
-FALLBACK_DB_URL = "postgresql://corah_user:YOUR_PASSWORD@localhost:5432/corah"
 
-# --- Files / paths (adjust as you like for local dev) ---
-# For local Mac dev you can point this to your Knowledge/ folder if you want
-RAW_DOCS_PATH = os.getenv("RAW_DOCS_PATH", "/home/ec2-user/corah/data/raw")
+# Where raw knowledge files live on the server
+RAW_DOCS_PATH = os.getenv(
+    "RAW_DOCS_PATH",
+    "/home/ec2-user/corah/data/raw"
+)
 
-# --- Models (central place so all code imports from here) ---
-EMBEDDING_MODEL = "text-embedding-3-small"   # 1536-dim, matches pgvector(1536)
-CHAT_MODEL      = "gpt-4o-mini"              # used by generator
+# Embedding model
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
-# --- Chunking defaults (shared by ingest/retrieval) ---
-CHUNK_SIZE     = 500
-CHUNK_OVERLAP  = 50
+# ---------- RAG answer controls ----------
+# Surface-level flags (you can toggle at runtime via env without code changes)
+SHOW_CITATIONS = _get_bool("SHOW_CITATIONS", False)  # include lightweight citations in responses
+DEBUG_RAG      = _get_bool("DEBUG_RAG", False)       # include retrieval debug info in API output
 
-# existing imports & settings...
+# LLM style controls
+TEMPERATURE    = _get_float("TEMPERATURE", 0.30)     # 0.2–0.5 recommended
+MAX_TOKENS     = _get_int("MAX_TOKENS", 600)         # answer token cap (used inside generator)
 
-# Feature flags
-SHOW_CITATIONS = False      # <- production default: no citations in responses
-DEBUG_RAG = False           # <- production default: no retrieval dump in responses
+# Retrieval quality gate
+MIN_SIM            = _get_float("MIN_SIM", 0.60)     # similarity threshold (0..1)
+ENABLE_SELF_QUERY  = _get_bool("ENABLE_SELF_QUERY", True)  # turn self-query rewriting on/off
+
+# ---------- Lead capture / reporting ----------
+USE_LLM_LEAD_SUMMARY = _get_bool("USE_LLM_LEAD_SUMMARY", True)
+LEAD_SUMMARY_MODEL   = os.getenv("LEAD_SUMMARY_MODEL", "gpt-4o-mini")
+
+# ---------- API server defaults (used by run scripts, not FastAPI itself) ----------
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = _get_int("PORT", 8000)
+
+# ---------- convenience echo (optional) ----------
+if _get_bool("CONFIG_ECHO", False):
+    print("[config] DB_URL=", DB_URL.replace("://", "://***:***@").replace("@", "@***:***"), flush=True)
+    print("[config] RAW_DOCS_PATH=", RAW_DOCS_PATH, flush=True)
+    print("[config] EMBEDDING_MODEL=", EMBEDDING_MODEL, flush=True)
+    print("[config] SHOW_CITATIONS=", SHOW_CITATIONS, flush=True)
+    print("[config] DEBUG_RAG=", DEBUG_RAG, flush=True)
+    print("[config] TEMPERATURE=", TEMPERATURE, flush=True)
+    print("[config] MIN_SIM=", MIN_SIM, flush=True)
+    print("[config] ENABLE_SELF_QUERY=", ENABLE_SELF_QUERY, flush=True)
+    print("[config] USE_LLM_LEAD_SUMMARY=", USE_LLM_LEAD_SUMMARY, flush=True)
+    print("[config] LEAD_SUMMARY_MODEL=", LEAD_SUMMARY_MODEL, flush=True)

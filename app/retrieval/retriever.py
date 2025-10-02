@@ -1,226 +1,104 @@
 # app/retrieval/retriever.py
-# -*- coding: utf-8 -*-
-
-"""
-Corah Retrieval Layer
-- Embeds a user query with OpenAI
-- Performs ANN search in Postgres (pgvector)
-- Returns top-K chunks as context
-
-Run:
-  python -m app.retrieval.retriever "What's included in the service catalogue?" --k 5 --pretty
-"""
-
 from __future__ import annotations
-
-import argparse
-import os
-import sys
-from typing import List, Dict, Any, Optional, Tuple
-
+from typing import List, Tuple, Dict, Any
 import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg2.extras
 
-try:
-    # OpenAI >= 1.0 SDK
-    from openai import OpenAI
-except Exception:
-    print("OpenAI SDK not found. Did you install in this venv?\n  pip install openai>=1.0.0")
-    raise
+from openai import OpenAI
 
-# ---- Config -----------------------------------------------------------------
+from app.core.config import (
+    DB_URL,
+    EMBEDDING_MODEL,
+    MIN_SIMILARITY,         # e.g. 0.25 (higher = stricter)
+)
+from app.api.schemas import SearchHit
 
-# Preferred: read DB URL from env (POSTGRES_URL). Fallback to app.core.config.DB_URL.
-DB_URL = os.getenv("POSTGRES_URL")
-if not DB_URL:
-    try:
-        from app.core.config import DB_URL as FALLBACK_DB_URL
-        DB_URL = FALLBACK_DB_URL
-    except Exception:
-        raise RuntimeError(
-            "No POSTGRES_URL in environment and app.core.config.DB_URL not available."
-        )
+client = OpenAI()
 
-# Embedding model (must match your 1536-dim schema)
-try:
-    from app.core.config import EMBEDDING_MODEL
-except Exception:
-    EMBEDDING_MODEL = "text-embedding-3-small"  # safe default
-
-# Optional: tiktoken for later trimming/packing
-try:
-    import tiktoken  # noqa
-    HAVE_TIKTOKEN = True
-except Exception:
-    HAVE_TIKTOKEN = False
-
-# ---- OpenAI client -----------------------------------------------------------
-
-_client: Optional[OpenAI] = None
-
-
-def _client_or_die() -> OpenAI:
-    global _client
-    if _client is None:
-        _client = OpenAI()  # reads OPENAI_API_KEY from env
-    return _client
-
-
-def embed_text(text: str) -> List[float]:
-    """
-    Create a 1536-dim embedding vector using OpenAI.
-    """
-    client = _client_or_die()
-    text = text.strip()
-    if not text:
-        raise ValueError("Cannot embed empty text")
-    resp = client.embeddings.create(model=EMBEDDING_MODEL, input=text)
-    return resp.data[0].embedding
-
-
-# ---- DB helpers --------------------------------------------------------------
-
-def get_connection():
-    """
-    Simple connection helper. For services, you might add pooling later.
-    """
+def _connect():
     return psycopg2.connect(DB_URL)
 
+def _embed(query: str) -> List[float]:
+    rsp = client.embeddings.create(model=EMBEDDING_MODEL, input=query)
+    return rsp.data[0].embedding  # type: ignore
 
-def _to_pgvector(vec: List[float]) -> str:
+def _search_vec(cx, qvec: List[float], k: int) -> List[Dict[str, Any]]:
     """
-    pgvector textual format: '[v1,v2,...,vn]'
-    Psycopg2 doesn't adapt python lists to pgvector by default, so we pass text.
+    Cosine similarity search over pgvector.
     """
-    # keep 6 decimal places to reduce payload
-    return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
-
-
-# ---- Retrieval ---------------------------------------------------------------
-
-def search(
-    query: str,
-    k: int = 5,
-    min_chars: int = 10,
-) -> List[Dict[str, Any]]:
-    """
-    Embed the query and retrieve top-K chunks ordered by distance (L2).
-    Returns a list of dicts: title, uri, chunk_id, chunk_no, content, distance.
-
-    NOTE:
-      - We use L2 distance (<->). Smaller is better.
-      - If you prefer a similarity score, you can convert to 1/(1+distance) on return.
-    """
-    emb = embed_text(query)
-    qv = _to_pgvector(emb)
-
-    sql = """
-    SELECT
-        d.id       AS doc_id,
-        d.title    AS title,
-        d.uri      AS uri,
-        c.id       AS chunk_id,
-        c.chunk_no AS chunk_no,
-        c.content  AS content,
-        (c.embedding <-> %s::vector) AS distance
-    FROM corah_store.chunks c
-    JOIN corah_store.documents d ON d.id = c.doc_id
-    ORDER BY c.embedding <-> %s::vector
-    LIMIT %s;
-    """
-
-    rows: List[Dict[str, Any]] = []
-    with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        # pass same vector twice (for ORDER BY and SELECT)
-        cur.execute(sql, (qv, qv, k))
-        fetched = cur.fetchall()
-
-    # Basic hygiene: drop accidental empty chunks, compute a simple similarity display
-    for r in fetched:
-        content = (r.get("content") or "").strip()
-        if len(content) < min_chars:
-            continue
-        distance = float(r["distance"])
-        similarity = 1.0 / (1.0 + distance)  # simple monotonic transform
-        rows.append(
-            {
-                "doc_id": r["doc_id"],
-                "title": r.get("title"),
-                "uri": r.get("uri"),
-                "chunk_id": r["chunk_id"],
-                "chunk_no": r["chunk_no"],
-                "content": content,
-                "distance": distance,
-                "similarity": similarity,
-            }
+    with cx.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+              c.id            AS chunk_id,
+              c.doc_id,
+              d.title,
+              d.uri,
+              c.chunk_no,
+              c.content,
+              1 - (c.embedding <=> %s::vector) AS similarity,     -- cosine sim
+              (c.embedding <=> %s::vector)     AS distance        -- cosine distance
+            FROM corah_store.chunks c
+            JOIN corah_store.documents d ON d.id = c.doc_id
+            ORDER BY c.embedding <=> %s::vector
+            LIMIT %s
+            """,
+            (qvec, qvec, qvec, k)
         )
+        return list(cur.fetchall())
 
-    return rows
+def _to_hits(rows: List[Dict[str, Any]]) -> List[SearchHit]:
+    hits: List[SearchHit] = []
+    for r in rows:
+        hits.append(
+            SearchHit(
+                doc=r.get("title") or "",
+                uri=r.get("uri"),
+                score=float(r.get("similarity") or 0.0),
+                dist=float(r.get("distance") or 0.0),
+                chunk_no=int(r.get("chunk_no") or 0),
+                title=r.get("title") or "",
+                text=r.get("content") or "",
+            )
+        )
+    return hits
 
-
-def make_context(
-    hits: List[Dict[str, Any]],
-    max_chars: int = 3000,
-) -> Tuple[str, List[Dict[str, Any]]]:
+def search(query: str, k: int = 5) -> List[SearchHit]:
     """
-    Concatenate retrieved chunks into a single context string, up to max_chars.
-    Returns (context, used_hits).
+    Returns top-k hits, filtered by MIN_SIMILARITY.
     """
-    used: List[Dict[str, Any]] = []
+    qvec = _embed(query)
+    with _connect() as cx:
+        rows = _search_vec(cx, qvec, k)
+    hits = _to_hits(rows)
+
+    # Similarity guard — filter obvious mismatches.
+    if MIN_SIMILARITY is not None:
+        hits = [h for h in hits if (h.score or 0.0) >= float(MIN_SIMILARITY)]
+
+    return hits
+
+def make_context(hits: List[SearchHit], max_chars: int = 3000) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Concatenate hit texts up to max_chars. Also return a lightweight 'used' list
+    for generator debug/citations.
+    """
     buf: List[str] = []
+    used: List[Dict[str, Any]] = []
     total = 0
-
     for h in hits:
-        snippet = h["content"].strip()
-        if not snippet:
+        t = (h.text or "").strip()
+        if not t:
             continue
-        if total + len(snippet) + 2 > max_chars:
+        if total + len(t) > max_chars:
             break
-        buf.append(snippet)
-        used.append(h)
-        total += len(snippet) + 2
-
-    return ("\n\n".join(buf), used)
-
-
-# ---- CLI ---------------------------------------------------------------------
-
-def _pretty_print(hits: List[Dict[str, Any]], show: int = 5):
-    show = max(1, min(show, len(hits)))
-    for i, h in enumerate(hits[:show], start=1):
-        print(f"\n[{i}] score≈{h['similarity']:.4f}  dist={h['distance']:.4f}  "
-              f"doc='{h.get('title') or ''}'  uri='{h.get('uri') or ''}'")
-        print("-" * 80)
-        print(h["content"][:1200])
-        if len(h["content"]) > 1200:
-            print("... [truncated]")
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Corah: pgvector retriever")
-    parser.add_argument("query", type=str, help="User query text")
-    parser.add_argument("--k", type=int, default=5, help="How many chunks to fetch")
-    parser.add_argument("--max-chars", type=int, default=3000, help="Context size")
-    parser.add_argument("--pretty", action="store_true", help="Pretty print results")
-    args = parser.parse_args(argv)
-
-    hits = search(args.query, k=args.k)
-    ctx, used = make_context(hits, max_chars=args.max_chars)
-
-    if args.pretty:
-        print(f"\nTop {len(used)} of {len(hits)} hits")
-        _pretty_print(hits, show=args.k)
-        print("\n" + "=" * 80)
-        print("CONTEXT (truncated to max-chars)")
-        print("=" * 80 + "\n")
-        print(ctx[:3000])
-    else:
-        # machine-readable
-        import json
-        print(json.dumps({"context": ctx, "hits": used}, ensure_ascii=False, indent=2))
-
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+        buf.append(t)
+        total += len(t)
+        used.append({
+            "title": h.title or h.doc,
+            "uri": h.uri,
+            "chunk_no": h.chunk_no,
+            "similarity": h.score,
+            "distance": h.dist,
+        })
+    return ("\n\n---\n\n".join(buf), used)

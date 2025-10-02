@@ -1,7 +1,7 @@
 # app/api/schemas.py
 from __future__ import annotations
-from typing import List, Optional
-from pydantic import BaseModel, EmailStr, Field
+from typing import List, Optional, Any
+from pydantic import BaseModel, EmailStr, constr
 
 # -----------------------------
 # Search / Retrieval
@@ -30,18 +30,18 @@ class QuestionIn(BaseModel):
     k: int = 5
 
 class ChatRequest(BaseModel):
+    session_id: Optional[str] = None     # enables short-term memory
     question: str
     k: int = 5
     max_context: int = 3000
-    session_id: Optional[str] = None  # <-- add this
 
 class AnswerOut(BaseModel):
     answer: str
 
 class ChatResponse(BaseModel):
     answer: str
-    rewritten_query: Optional[str] = None
-    used: Optional[List[SearchHit]] = None
+    rewritten_query: Optional[str] = None     # useful for debugging/eval (can hide in UI)
+    used: Optional[List[SearchHit]] = None    # chunks actually used (for internal audit)
 
 # -----------------------------
 # Lead Capture – session flow
@@ -60,12 +60,6 @@ class LeadOut(BaseModel):
     missing: List[str] = []
     lead_id: Optional[int] = None
 
-class ChatRequest(BaseModel):
-    session_id: Optional[str] = None
-    question: str
-    k: int = 5
-    max_context: int = 3000
-
 # -----------------------------
 # Lead Capture – validated payload
 # (useful for saving a complete/partial lead)
@@ -74,7 +68,7 @@ class ChatRequest(BaseModel):
 class Lead(BaseModel):
     name: Optional[str] = None
     email: Optional[EmailStr] = None
-    phone: Optional[constr(pattern=r'^[\d+\-\s]{7,20}$')] = None # flexible phone validation
+    phone: Optional[constr(regex=r'^[\d+\-\s]{7,20}$')] = None  # flexible phone validation
     company_name: Optional[str] = None
     company_size: Optional[str] = None
     industry: Optional[str] = None
