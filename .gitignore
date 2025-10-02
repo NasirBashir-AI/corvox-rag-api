@@ -1,17 +1,15 @@
-# Python / venv
-.venv/
+# Python bytecode caches
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# macOS
+# Virtual envs / local secrets
+.venv/
+.env
+.env.*
+
+# OS/editor noise
 .DS_Store
-
-# zips / build artifacts
-*.zip
-
-# editor
 .vscode/
 .idea/
-
-# env files (never commit secrets)
-.env
