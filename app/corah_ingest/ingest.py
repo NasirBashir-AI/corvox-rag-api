@@ -142,7 +142,7 @@ def ingest_folder(root: str, rebuild: bool = False) -> Tuple[int, int]:
             for c, emb in zip(parts, embeddings):
                 c.embedding = emb
 
-            doc_id = upsert_document(cx, source="raw", uri=uri, title=title)
+            doc_id = upsert_document(cx, title=title, uri=uri)
             insert_chunks(cx, doc_id, parts)
             doc_count += 1
             chunk_count += len(parts)
