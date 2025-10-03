@@ -8,6 +8,16 @@ from typing import List, Tuple, Optional
 import psycopg2
 import psycopg2.extras
 
+# --- Postgres / pgvector setup ---
+from pgvector.psycopg2 import register_vector
+from app.core.config import DB_URL
+
+def get_pg_conn():
+    conn = psycopg2.connect(DB_URL)
+    register_vector(conn)  # so we can insert Python lists into VECTOR(1536)
+    return conn
+
+
 from openai import OpenAI
 
 from app.core.config import (
@@ -71,32 +81,45 @@ def embed_batch(texts: List[str]) -> List[List[float]]:
 
 def upsert_document(cx, title: str, uri: str) -> int:
     """
-    Inserts a row into corah_store.documents and returns id.
-    If you want true upsert-by-uri, add ON CONFLICT on a unique index on uri.
+    Insert or update a document record in Postgres.
+    Returns the document id.
     """
-    with cx.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO corah_store.documents (title, uri)
-            VALUES (%s, %s)
-            RETURNING id
-            """,
-            (title, uri),
-        )
-        return cur.fetchone()[0]
+    conn = get_pg_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO documents (uri, title)
+        VALUES (%s, %s)
+        ON CONFLICT (uri) DO UPDATE SET title = EXCLUDED.title
+        RETURNING id;
+    """, (uri, title))
+
+    doc_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+    return doc_id
+
 
 def insert_chunks(cx, doc_id: int, chunks: List[Chunk]):
+    """
+    Bulk-insert chunks into public.chunks with pgvector embeddings.
+    Expects each Chunk to have: chunk_no, text, embedding (list[float]).
+    """
     with cx.cursor() as cur:
         psycopg2.extras.execute_values(
             cur,
             """
-            INSERT INTO corah_store.chunks (doc_id, chunk_no, content, embedding)
+            INSERT INTO chunks (document_id, chunk_index, content, embedding)
             VALUES %s
+            ON CONFLICT (document_id, chunk_index) DO NOTHING
             """,
             [
-                (doc_id, ch.chunk_no, ch.text, ch.embedding) for ch in chunks
+                (doc_id, ch.chunk_no, ch.text, ch.embedding)
+                for ch in chunks
             ],
         )
+
 
 def clear_all(cx):
     with cx.cursor() as cur:
