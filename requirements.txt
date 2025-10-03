@@ -8,6 +8,7 @@ starlette>=0.40
 requests>=2.26.0
 python-dotenv>=1.0
 click>=8.0
+email-validator>=2.0
 
 # Optional but used in retriever & API server
 httptools>=0.6
