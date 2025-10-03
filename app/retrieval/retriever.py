@@ -9,7 +9,7 @@ from openai import OpenAI
 from app.core.config import (
     DB_URL,
     EMBEDDING_MODEL,
-    MIN_SIMILARITY,         # e.g. 0.25 (higher = stricter)
+    MIN_SIM,         # e.g. 0.25 (higher = stricter)
 )
 from app.api.schemas import SearchHit
 
@@ -73,8 +73,8 @@ def search(query: str, k: int = 5) -> List[SearchHit]:
     hits = _to_hits(rows)
 
     # Similarity guard — filter obvious mismatches.
-    if MIN_SIMILARITY is not None:
-        hits = [h for h in hits if (h.score or 0.0) >= float(MIN_SIMILARITY)]
+    if MIN_SIM is not None:
+        hits = [h for h in hits if (h.score or 0.0) >= float(MIN_SIM)]
 
     return hits
 
