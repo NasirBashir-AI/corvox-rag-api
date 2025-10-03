@@ -9,8 +9,6 @@ requests>=2.26.0
 python-dotenv>=1.0
 click>=8.0
 
-email-validator>=2.0
-
 # Optional but used in retriever & API server
 httptools>=0.6
 uvloop>=0.21
@@ -20,3 +18,4 @@ websockets>=15.0
 # Token counting / text utils
 tiktoken>=0.5
 anyio>=4.0
+email-validator>=2.0
