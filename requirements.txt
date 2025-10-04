@@ -1,21 +1,20 @@
-# Core dependencies
-openai>=1.0.0
-psycopg2-binary>=2.9
-pydantic<2
+# Core
 fastapi>=0.115
 uvicorn>=0.37
-starlette>=0.40
+openai>=1.0.0
+pydantic>=2.7,<3
+psycopg2-binary>=2.9,<3
 requests>=2.26.0
 python-dotenv>=1.0
 click>=8.0
 
-# Optional but used in retriever & API server
+# Performance / server extras (optional)
 httptools>=0.6
 uvloop>=0.21
 watchfiles>=1.1
 websockets>=15.0
 
-# Token counting / text utils
+# Text / tokenization / validation
 tiktoken>=0.5
 anyio>=4.0
 email-validator>=2.0

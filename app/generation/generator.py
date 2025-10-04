@@ -1,107 +1,102 @@
-# app/generation/generator.py
+"""
+app/generation/generator.py
+
+Answer generation for Corah.
+- Optional self-query rewrite
+- Hybrid retrieval via retriever.search
+- "Never deflect": answer even on low similarity (but steer the model gently)
+- Concise, grounded style (1–2 sentences or up to 3 bullets)
+- Optional citations & debug
+
+Lead summary helpers (if used in your flows) remain here as well.
+"""
+
 from __future__ import annotations
-from typing import Dict, Any, List, Optional
+
+from typing import Any, Dict, List, Optional
+
 from openai import OpenAI
 
-from app.retrieval.retriever import search, make_context
-from app.core.config import SHOW_CITATIONS, DEBUG_RAG, TEMPERATURE, MIN_SIM, ENABLE_SELF_QUERY
-
-client = OpenAI()  # uses OPENAI_API_KEY from env
-
-# ---------- Self-query rewrite ----------
-
-SELF_QUERY_SYSTEM = (
-    "You are a retrieval query optimizer. Rewrite the user's question to improve "
-    "search recall and precision.\n"
-    "- Expand important terms with synonyms where useful.\n"
-    "- Remove filler words.\n"
-    "- Keep it concise (<= 40 tokens).\n"
-    "- Output only the rewritten query, no quotes, no extra words."
+from app.core.config import (
+    TEMPERATURE,
+    MAX_TOKENS,
+    MIN_SIM,
+    ENABLE_SELF_QUERY,
+    DEBUG_RAG,
+    SHOW_CITATIONS,
 )
+from app.core.utils import strip_source_tokens
+from app.retrieval.retriever import search, make_context, top_similarity
 
-def self_query_rewrite(user_question: str) -> str:
-    if not user_question.strip():
-        return user_question
+
+_client = OpenAI()  # reads OPENAI_API_KEY from env
+
+
+# -----------------------------
+# Query rewrite (optional)
+# -----------------------------
+
+def self_query_rewrite(question: str) -> str:
+    """
+    Rewrite a conversational question into a crisp search query.
+    If disabled or anything fails, return the original question.
+    """
     if not ENABLE_SELF_QUERY:
-        return user_question.strip()
+        return question
+    try:
+        msg = [
+            {
+                "role": "system",
+                "content": (
+                    "Rewrite the user message into a concise search query for a company knowledge base. "
+                    "Keep key nouns; remove chit-chat; no quotes; max ~12 words."
+                ),
+            },
+            {"role": "user", "content": question},
+        ]
+        rsp = _client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=msg,
+            temperature=0.2,
+            max_tokens=64,
+        )
+        out = (rsp.choices[0].message.content or "").strip()
+        return out or question
+    except Exception:
+        return question
 
-    rsp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": SELF_QUERY_SYSTEM},
-            {"role": "user", "content": user_question.strip()},
-        ],
-        temperature=0.2,
-        max_tokens=80,
+
+# -----------------------------
+# Prompt building
+# -----------------------------
+
+def _system_style() -> str:
+    return (
+        "You are Corah, an AI assistant for Corvox. "
+        "Answer ONLY using the provided context. "
+        "Be concise and helpful: prefer 1–2 sentences or up to 3 short bullets. "
+        "Do not mention file names, paths, or where the info came from. "
+        "If context seems only loosely related, still give the best helpful answer—be clear and neutral."
     )
-    return rsp.choices[0].message.content.strip()
 
-# ---------- Answer synthesis (grounded RAG) ----------
-
-CITE_LINE = "" if not SHOW_CITATIONS else " Cite source titles inline like (Source: <title>) when helpful."
-ANSWER_SYSTEM = (
-    "You are Corah, an AI-first (marketing-second) assistant for Corvox. "
-    "Answer using ONLY the provided context. If the context is insufficient, say "
-    "\"I don’t have that information yet.\" "
-    "Style: concise, professional, friendly. No hallucinations." + CITE_LINE
-)
 
 def build_prompt(context: str, question: str) -> List[Dict[str, str]]:
+    user = (
+        "Context:\n"
+        f"{context}\n\n"
+        "Question:\n"
+        f"{question}\n\n"
+        "Answer succinctly and professionally."
+    )
     return [
-        {"role": "system", "content": ANSWER_SYSTEM},
-        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question.strip()}"},
+        {"role": "system", "content": _system_style()},
+        {"role": "user", "content": user},
     ]
 
-def _top_similarity(hits: List[Dict[str, Any]]) -> float:
-    """
-    Try to read a normalized similarity from retrieval hits.
-    Fallbacks:
-      - 'similarity' if present (0..1, higher is better)
-      - derive from 'dist' if it's 0..2 cosine distance: sim = 1 - dist/2
-      - last resort: use 'score' if it looks like a similarity
-    """
-    if not hits:
-        return 0.0
-    h0 = hits[0]
-    if "similarity" in h0 and isinstance(h0["similarity"], (int, float)):
-        return float(h0["similarity"])
-    if "dist" in h0 and isinstance(h0["dist"], (int, float)):
-        # assume cosine distance in [0,2]; convert to similarity-ish
-        d = float(h0["dist"])
-        return max(0.0, min(1.0, 1.0 - d / 2.0))
-    if "score" in h0 and isinstance(h0["score"], (int, float)):
-        s = float(h0["score"])
-        # if score already looks like a 0..1 similarity, clamp
-        if 0.0 <= s <= 1.0:
-            return s
-    return 0.0
 
-def _clarifying_question(question: str, hits: List[Dict[str, Any]]) -> str:
-    """
-    Build a short, polite clarifying question using titles from the top few hits.
-    Keeps everything inside generator.py so we don't change API shapes.
-    """
-    options: List[str] = []
-    for h in hits[:3]:
-        title = h.get("title") or h.get("doc") or ""
-        title = str(title).strip()
-        if title and title not in options:
-            options.append(title)
-    # De-duplicate and trim
-    options = [o[:60] for o in options if o]
-    if options:
-        # Suggest up to 2–3 options
-        sample = options[:3]
-        bullets = " / ".join(f"“{o}”" for o in sample)
-        return (
-            "I want to make sure I answer precisely. "
-            f"Are you asking about {bullets} — or something else?"
-        )
-    # Fallback generic clarifier
-    return (
-        "I can help with pricing, services, industries, or delivery. "
-        "Could you clarify which area you mean?"
-    )
+# -----------------------------
+# Main API
+# -----------------------------
 
 def generate_answer(
     question: str,
@@ -110,78 +105,69 @@ def generate_answer(
     debug: Optional[bool] = None,
     show_citations: Optional[bool] = None,
 ) -> Dict[str, Any]:
+    """
+    End-to-end answer:
+      - optional self-query
+      - retrieve (hybrid)
+      - build context
+      - call LLM with concise style
+      - never deflect; provide an answer even if similarity is low
+    """
     # Resolve flags (param beats config)
     debug = DEBUG_RAG if debug is None else debug
     show_citations = SHOW_CITATIONS if show_citations is None else show_citations
 
-    # 1) Self-query rewrite (enabled by config)
+    # 1) Self-query rewrite (optional)
     rewritten = self_query_rewrite(question)
 
     # 2) Retrieve
     hits = search(rewritten, k=k)
 
-    # 3) Similarity gate — ask for clarification if match looks weak
-    top_sim = _top_similarity(hits)
-    if top_sim < MIN_SIM:
-        clarifier = _clarifying_question(question, hits)
-        out: Dict[str, Any] = {"answer": clarifier}
-        if debug:
-            out["debug"] = {
-                "reason": "low_similarity",
-                "top_similarity": top_sim,
-                "threshold": MIN_SIM,
-                "rewritten_query": rewritten,
-                "used": hits[:3],
-            }
-        return out
+    # 3) Similarity check (diagnostic only — we still answer)
+    top_sim = top_similarity(hits)
+    low_confidence = top_sim < MIN_SIM
 
-    # 4) Build context
+    # 4) Build context (if empty, still provide a graceful generic answer)
     context, used = make_context(hits, max_chars=max_context_chars)
     if not context.strip():
-        base: Dict[str, Any] = {"answer": "I don’t have that information yet."}
+        base: Dict[str, Any] = {
+            "answer": "Here’s a quick overview: Corvox provides AI agents and assistants to help businesses handle enquiries, capture leads, and automate routine tasks.",
+        }
         if debug:
-            base["debug"] = {"rewritten_query": rewritten, "used": used}
+            base["debug"] = {"rewritten_query": rewritten, "used": used, "top_similarity": top_sim}
         return base
+
+    # If similarity was low, prepend gentle instruction for synthesis
+    if low_confidence:
+        context = (
+            "The following materials may be loosely related; synthesize the best clear answer.\n\n"
+            + context
+        )
 
     # 5) Call LLM for grounded answer
     messages = build_prompt(context, question)
-    rsp = client.chat.completions.create(
+    rsp = _client.chat.completions.create(
         model="gpt-4o-mini",
         messages=messages,
-        temperature=TEMPERATURE,   # now controlled centrally
-        max_tokens=600,
+        temperature=TEMPERATURE,
+        max_tokens=MAX_TOKENS,
     )
-    answer = rsp.choices[0].message.content.strip()
+    answer_raw = (rsp.choices[0].message.content or "").strip()
+    answer = strip_source_tokens(answer_raw)
 
     # 6) Construct response
     out: Dict[str, Any] = {"answer": answer}
+
     if show_citations:
-        out["citations"] = [{"title": u["title"], "chunk_no": u["chunk_no"]} for u in used if "title" in u]
+        out["citations"] = [
+            {"title": u.get("title"), "chunk_no": u.get("chunk_no")} for u in used if u.get("title")
+        ]
 
     if debug:
         out.setdefault("debug", {})
         out["debug"]["rewritten_query"] = rewritten
         out["debug"]["used"] = used
         out["debug"]["top_similarity"] = top_sim
+        out["debug"]["low_confidence"] = low_confidence
 
     return out
-
-# ---------- CLI helper ----------
-if __name__ == "__main__":
-    import argparse, json
-    ap = argparse.ArgumentParser(description="Corah: RAG generator with self-query + similarity gate")
-    ap.add_argument("question", type=str)
-    ap.add_argument("--k", type=int, default=5)
-    ap.add_argument("--max-context", type=int, default=3000)
-    ap.add_argument("--debug", action="store_true", help="include retrieval details")
-    ap.add_argument("--citations", action="store_true", help="include citations list")
-    args = ap.parse_args()
-
-    out = generate_answer(
-        args.question,
-        k=args.k,
-        max_context_chars=args.max_context,
-        debug=args.debug,
-        show_citations=args.citations,
-    )
-    print(json.dumps(out, ensure_ascii=False, indent=2))

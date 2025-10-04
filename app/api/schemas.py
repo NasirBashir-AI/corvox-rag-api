@@ -1,78 +1,72 @@
-# app/api/schemas.py
-from __future__ import annotations
-from typing import List, Optional, Any
-from pydantic import BaseModel, EmailStr, Field
+"""
+app/api/schemas.py
 
-# -----------------------------
-# Search / Retrieval
-# -----------------------------
+Pydantic models for Corah's API layer.
+Keep these concise and stable so clients don't break.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
+
+
+# ---------------------------
+# Health
+# ---------------------------
+
+class HealthResponse(BaseModel):
+    ok: bool = True
+
+
+# ---------------------------
+# Search (retrieval) models
+# ---------------------------
 
 class SearchHit(BaseModel):
-    doc: str
-    uri: Optional[str] = None
-    score: Optional[float] = None
-    dist: Optional[float] = None
+    # Identifiers (may be None if not exposed by the query)
+    document_id: Optional[int] = None
     chunk_no: Optional[int] = None
+
+    # Metadata
     title: Optional[str] = None
-    text: Optional[str] = None
+    source_uri: Optional[str] = None  # e.g., s3 path or doc slug
+
+    # Scoring
+    score: float = Field(..., description="Blended relevance score (0..1)")
+
+    # Content preview
+    content: Optional[str] = None
+
 
 class SearchResponse(BaseModel):
-    query: str
-    k: int
-    hits: List[SearchHit]
+    hits: List[SearchHit] = []
 
-# -----------------------------
-# Q&A / Chat
-# -----------------------------
 
-class QuestionIn(BaseModel):
-    question: str
-    k: int = 5
+# ---------------------------
+# Chat (generation) models
+# ---------------------------
 
 class ChatRequest(BaseModel):
-    session_id: Optional[str] = None     # enables short-term memory
-    question: str
-    k: int = 5
-    max_context: int = 3000
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Client session identifier for short-term memory."
+    )
+    question: str = Field(..., description="User's input text.")
 
-class AnswerOut(BaseModel):
-    answer: str
+    # Optional knobs (all are overrides; if None, server uses defaults)
+    k: Optional[int] = Field(default=None, description="Top-k retrieval override.")
+    max_context: Optional[int] = Field(default=None, description="Max chars for assembled context.")
+    debug: Optional[bool] = Field(default=None, description="If true, include retrieval/trace in response.")
+    citations: Optional[bool] = Field(default=None, description="If true, include simple citations list.")
+
+
+class Citation(BaseModel):
+    title: Optional[str] = None
+    chunk_no: Optional[int] = None
+
 
 class ChatResponse(BaseModel):
     answer: str
-    rewritten_query: Optional[str] = None     # useful for debugging/eval (can hide in UI)
-    used: Optional[List[SearchHit]] = None    # chunks actually used (for internal audit)
-
-# -----------------------------
-# Lead Capture – session flow
-# -----------------------------
-
-class LeadStart(BaseModel):
-    session_id: str
-
-class LeadMessageIn(BaseModel):
-    session_id: str
-    message: str
-
-class LeadOut(BaseModel):
-    reply: str
-    done: bool = False
-    missing: List[str] = []
-    lead_id: Optional[int] = None
-
-# -----------------------------
-# Lead Capture – validated payload
-# (useful for saving a complete/partial lead)
-# -----------------------------
-
-class Lead(BaseModel):
-    name: Optional[str] = None
-    email: Optional[EmailStr] = None
-    phone: Optional[str] = Field(
-        None, pattern=r'^[\d+\-\s]{7,20}$', description="Flexible phone validation"
-    )
-    company_name: Optional[str] = None
-    company_size: Optional[str] = None
-    industry: Optional[str] = None
-    requirements: Optional[str] = None
-    goals: Optional[str] = None
+    citations: Optional[List[Citation]] = None
+    debug: Optional[Dict[str, Any]] = None

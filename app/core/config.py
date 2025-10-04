@@ -1,7 +1,10 @@
 """
-Central config for Corah.
-- Reads from environment first (so /etc/environment on EC2 wins)
-- Falls back to sensible defaults for local dev
+app/core/config.py
+
+Central configuration for Corah.
+- Reads from environment variables first (so /etc/environment on EC2 wins)
+- Falls back to sensible defaults for local/dev
+- Keep this file self-contained (no imports from other app modules to avoid cycles)
 """
 
 from __future__ import annotations
@@ -26,8 +29,9 @@ def _get_int(name: str, default: int) -> int:
     except Exception:
         return default
 
+
 # ---------- core services ----------
-# OpenAI API key is read implicitly by the OpenAI SDK from the environment:
+# OpenAI API key is read implicitly by the OpenAI SDK:
 #   export OPENAI_API_KEY=sk-...
 # No need to duplicate it here.
 
@@ -44,34 +48,43 @@ RAW_DOCS_PATH = os.getenv(
     "/home/ec2-user/corah/data/raw"
 )
 
-# Embedding model
+# Embedding model (used by ingestion and retrieval)
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
-# ---------- Ingestion / chunking (NEW) ----------
-# Used by the ingestion pipeline and sometimes by retrieval for windowing
+
+# ---------- Ingestion / chunking ----------
 CHUNK_SIZE    = _get_int("CHUNK_SIZE", 900)
 CHUNK_OVERLAP = _get_int("CHUNK_OVERLAP", 120)
 
-# ---------- RAG answer controls ----------
-# Surface-level flags (you can toggle at runtime via env without code changes)
-SHOW_CITATIONS = _get_bool("SHOW_CITATIONS", False)  # include lightweight citations in responses
-DEBUG_RAG      = _get_bool("DEBUG_RAG", False)       # include retrieval debug info in API output
 
-# LLM style controls
-TEMPERATURE    = _get_float("TEMPERATURE", 0.30)     # 0.2–0.5 recommended
-MAX_TOKENS     = _get_int("MAX_TOKENS", 600)         # answer token cap (used inside generator)
+# ---------- RAG / Answer generation controls ----------
+# Surface flags (toggleable at runtime via env without code changes)
+SHOW_CITATIONS  = _get_bool("SHOW_CITATIONS", False)   # include lightweight citations in responses
+DEBUG_RAG       = _get_bool("DEBUG_RAG", False)        # include retrieval debug info in API output
 
-# Retrieval quality gate
-MIN_SIM            = _get_float("MIN_SIM", 0.60)     # similarity threshold (0..1)
-ENABLE_SELF_QUERY  = _get_bool("ENABLE_SELF_QUERY", True)  # turn self-query rewriting on/off
+# LLM style controls (Phase A: more deterministic, concise)
+TEMPERATURE     = _get_float("TEMPERATURE", 0.10)      # tightened for crisp, grounded answers
+MAX_TOKENS      = _get_int("MAX_TOKENS", 600)          # cap for completion tokens
+MIN_SIM         = _get_float("MIN_SIM", 0.60)          # similarity threshold (0..1) used for diagnostics
+RETRIEVAL_TOP_K = _get_int("RETRIEVAL_TOP_K", 5)       # default top-k for retrieval when not specified
 
-# ---------- Lead capture / reporting ----------
+# Query rewrite / self-querying
+ENABLE_SELF_QUERY = _get_bool("ENABLE_SELF_QUERY", True)
+
+# Router and retrieval feature flags (Phase A/B/C)
+ENABLE_SMALLTALK = _get_bool("ENABLE_SMALLTALK", True) # short-circuit greetings/small talk
+ENABLE_HYBRID    = _get_bool("ENABLE_HYBRID", True)    # vector + FTS blending in Postgres
+ENABLE_FACTS     = _get_bool("ENABLE_FACTS", True)     # use structured facts for contact/pricing if available
+
+# Lead capture / reporting
 USE_LLM_LEAD_SUMMARY = _get_bool("USE_LLM_LEAD_SUMMARY", True)
 LEAD_SUMMARY_MODEL   = os.getenv("LEAD_SUMMARY_MODEL", "gpt-4o-mini")
+
 
 # ---------- API server defaults (used by run scripts, not FastAPI itself) ----------
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = _get_int("PORT", 8000)
+
 
 # ---------- convenience echo (optional) ----------
 def _mask_db_url(u: str) -> str:
@@ -94,7 +107,10 @@ if _get_bool("CONFIG_ECHO", False):
     print("[config] TEMPERATURE=", TEMPERATURE, flush=True)
     print("[config] MAX_TOKENS=", MAX_TOKENS, flush=True)
     print("[config] MIN_SIM=", MIN_SIM, flush=True)
+    print("[config] RETRIEVAL_TOP_K=", RETRIEVAL_TOP_K, flush=True)
     print("[config] ENABLE_SELF_QUERY=", ENABLE_SELF_QUERY, flush=True)
+    print("[config] ENABLE_SMALLTALK=", ENABLE_SMALLTALK, flush=True)
+    print("[config] ENABLE_HYBRID=", ENABLE_HYBRID, flush=True)
+    print("[config] ENABLE_FACTS=", ENABLE_FACTS, flush=True)
     print("[config] USE_LLM_LEAD_SUMMARY=", USE_LLM_LEAD_SUMMARY, flush=True)
     print("[config] LEAD_SUMMARY_MODEL=", LEAD_SUMMARY_MODEL, flush=True)
-    print("[config] HOST=", HOST, "PORT=", PORT, flush=True)

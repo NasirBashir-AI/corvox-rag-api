@@ -1,138 +1,255 @@
-# app/corah_ingest/db_utils.py
+"""
+app/corah_ingest/db_utils.py
+
+Postgres helpers for ingestion:
+- insert/upsert documents and chunks
+- optional wipe/rebuild helpers
+- lightweight facts helpers for contact/pricing
+
+Design notes
+- Uses app.core.utils.pg_cursor / rows_to_dicts to avoid duplicating DB glue.
+- Keeps DDL to a minimum; safe-guards are wrapped in try/except so ingestion never
+  dies on already-existing objects.
+"""
+
 from __future__ import annotations
-from typing import Iterable, List, Sequence, Tuple
 
-import psycopg2
-import psycopg2.extras
-from psycopg2.extras import execute_values
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from app.core.config import DB_URL
+from app.core.utils import pg_cursor, rows_to_dicts
 
 
 # -----------------------------
-# Connections
+# Schema helpers (safe / optional)
 # -----------------------------
 
-def get_connection():
+def ensure_schema() -> None:
     """
-    Return a fresh psycopg2 connection. Callers are responsible for closing it.
-    We keep this simple (no pool) to remain compatible with existing call sites
-    that do conn.close() in finally blocks.
+    Ensure expected schema objects exist. This is defensive and safe to call;
+    it won't error if objects already exist.
     """
-    # If your RDS forces SSL, you can add: sslmode="require"
-    return psycopg2.connect(DB_URL)
+    with pg_cursor() as cur:
+        # Schema
+        try:
+            cur.execute("CREATE SCHEMA IF NOT EXISTS corah_store;")
+        except Exception:
+            pass
+
+        # Documents
+        try:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS corah_store.documents (
+                    id           BIGSERIAL PRIMARY KEY,
+                    title        TEXT,
+                    uri          TEXT,          -- logical identifier (s3://... or slug)
+                    source_uri   TEXT,          -- optional original path
+                    created_at   TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
+        except Exception:
+            pass
+
+        # Chunks
+        try:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS corah_store.chunks (
+                    id           BIGSERIAL PRIMARY KEY,
+                    document_id  BIGINT REFERENCES corah_store.documents(id) ON DELETE CASCADE,
+                    chunk_no     INT NOT NULL,
+                    content      TEXT NOT NULL,
+                    embedding    vector,        -- pgvector; dimension set at extension level
+                    token_count  INT DEFAULT 0
+                );
+                """
+            )
+        except Exception:
+            pass
+
+        # Facts (structured values extracted at ingest)
+        try:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS corah_store.facts (
+                    id         BIGSERIAL PRIMARY KEY,
+                    name       TEXT NOT NULL,     -- e.g., contact_email, contact_phone, pricing_bullet
+                    value      TEXT NOT NULL,
+                    uri        TEXT,              -- which doc this fact came from (best-effort)
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
+        except Exception:
+            pass
+
+        # Helpful index for FTS (optional; safe if it already exists)
+        try:
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chunks_tsv ON corah_store.chunks
+                USING GIN (to_tsvector('english', content));
+                """
+            )
+        except Exception:
+            pass
 
 
 # -----------------------------
-# Helpers
+# Documents
 # -----------------------------
 
-def _vector_literal(vec: Sequence[float]) -> str:
+def insert_document(title: str, uri: Optional[str] = None, source_uri: Optional[str] = None) -> int:
     """
-    Build a pgvector literal string from a Python list, e.g. "[0.1,-0.2,...]".
-    We will cast this to ::vector inside SQL.
+    Insert a document row and return its id.
+    If a row with the same uri already exists, return that id (idempotent).
     """
-    return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+    with pg_cursor() as cur:
+        if uri:
+            cur.execute(
+                "SELECT id FROM corah_store.documents WHERE uri = %s LIMIT 1;",
+                (uri,),
+            )
+            row = cur.fetchone()
+            if row:
+                return int(row[0])
+
+        cur.execute(
+            """
+            INSERT INTO corah_store.documents (title, uri, source_uri)
+            VALUES (%s, %s, %s)
+            RETURNING id;
+            """,
+            (title, uri, source_uri),
+        )
+        return int(cur.fetchone()[0])
+
+
+def upsert_document(title: str, uri: Optional[str] = None, source_uri: Optional[str] = None) -> int:
+    """
+    Upsert variant for convenience.
+    - If uri exists, update title/source_uri if provided and return id.
+    - Otherwise insert new.
+    """
+    with pg_cursor() as cur:
+        if uri:
+            cur.execute(
+                "SELECT id, title, source_uri FROM corah_store.documents WHERE uri = %s LIMIT 1;",
+                (uri,),
+            )
+            r = cur.fetchone()
+            if r:
+                doc_id = int(r[0])
+                # Update if new values are provided
+                if (title or source_uri):
+                    cur.execute(
+                        """
+                        UPDATE corah_store.documents
+                           SET title = COALESCE(%s, title),
+                               source_uri = COALESCE(%s, source_uri)
+                         WHERE id = %s;
+                        """,
+                        (title, source_uri, doc_id),
+                    )
+                return doc_id
+
+        # Fallback to insert
+        cur.execute(
+            """
+            INSERT INTO corah_store.documents (title, uri, source_uri)
+            VALUES (%s, %s, %s)
+            RETURNING id;
+            """,
+            (title, uri, source_uri),
+        )
+        return int(cur.fetchone()[0])
 
 
 # -----------------------------
-# Schema management (optional)
+# Chunks
 # -----------------------------
 
-def ensure_schema(cur) -> None:
+def insert_chunk(
+    document_id: int,
+    chunk_no: int,
+    content: str,
+    embedding: Sequence[float],
+    token_count: int = 0,
+) -> int:
     """
-    Create schema/tables if they do not exist. This is optional; most of the time
-    your schema will already be provisioned by migrations or a one-time SQL.
+    Insert a single chunk with its embedding. Returns new chunk id.
     """
-    cur.execute(
-        """
-        CREATE SCHEMA IF NOT EXISTS corah_store;
+    with pg_cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO corah_store.chunks (document_id, chunk_no, content, embedding, token_count)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id;
+            """,
+            (document_id, chunk_no, content, embedding, token_count),
+        )
+        return int(cur.fetchone()[0])
 
-        CREATE TABLE IF NOT EXISTS corah_store.documents (
-            id          BIGSERIAL PRIMARY KEY,
-            source      TEXT NOT NULL DEFAULT 'raw',
-            uri         TEXT NOT NULL,
-            title       TEXT,
-            created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
 
-        -- Adjust vector dimension to match your embeddings model
-        CREATE TABLE IF NOT EXISTS corah_store.chunks (
-            id          BIGSERIAL PRIMARY KEY,
-            doc_id      BIGINT NOT NULL REFERENCES corah_store.documents(id) ON DELETE CASCADE,
-            chunk_no    INT NOT NULL,
-            title       TEXT,
-            content     TEXT,
-            embedding   VECTOR(1536),
-            token_count INT DEFAULT 0
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_chunks_doc
-            ON corah_store.chunks (doc_id, chunk_no);
-
-        -- cosine distance ops
-        CREATE INDEX IF NOT EXISTS idx_chunks_embed
-            ON corah_store.chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-
-        CREATE INDEX IF NOT EXISTS idx_chunks_content_trgm
-            ON corah_store.chunks USING gin (content gin_trgm_ops);
-        """
-    )
+def delete_all_documents_and_chunks() -> None:
+    """Dangerous but useful for a full rebuild."""
+    with pg_cursor() as cur:
+        # Chunks depend on documents; delete chunks first for clarity (CASCADE also handles it)
+        cur.execute("DELETE FROM corah_store.chunks;")
+        cur.execute("DELETE FROM corah_store.documents;")
 
 
 # -----------------------------
-# Insert operations
+# Facts
 # -----------------------------
 
-def insert_document(cur, source: str, uri: str, title: str) -> int:
+def insert_fact(name: str, value: str, uri: Optional[str] = None) -> int:
     """
-    Insert a single document row and return its id.
+    Simple append-only insert for a fact. Retrieval sorts by updated_at DESC,
+    so the latest value naturally wins.
     """
-    cur.execute(
-        """
-        INSERT INTO corah_store.documents (source, uri, title)
-        VALUES (%s, %s, %s)
-        RETURNING id;
-        """,
-        (source, uri, title),
-    )
-    return int(cur.fetchone()[0])
+    with pg_cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO corah_store.facts (name, value, uri)
+            VALUES (%s, %s, %s)
+            RETURNING id;
+            """,
+            (name, value, uri),
+        )
+        return int(cur.fetchone()[0])
 
 
-def insert_chunks(
-    cur,
-    doc_id: int,
-    rows: Iterable[Tuple[int, str, Sequence[float], int]],
-) -> None:
+def upsert_fact(name: str, value: str, uri: Optional[str] = None) -> int:
     """
-    Bulk insert chunk rows for a document.
-
-    Args:
-        cur: psycopg cursor
-        doc_id: target document id
-        rows: iterable of tuples
-              (chunk_no, content, embedding_vector, token_count)
-
-    We pass embeddings as a pgvector literal and cast to ::vector inside SQL.
+    Upsert-style: delete older identical name(s) then insert fresh.
+    (We avoid assuming a unique constraint; this keeps it simple and deterministic.)
     """
-    # Prepare transformed rows for execute_values
-    # Convert each embedding list into a vector literal string
-    prepared = [
-        (doc_id, chunk_no, content, _vector_literal(embedding), token_count)
-        for (chunk_no, content, embedding, token_count) in rows
-    ]
+    with pg_cursor() as cur:
+        try:
+            cur.execute("DELETE FROM corah_store.facts WHERE name = %s;", (name,))
+        except Exception:
+            # If delete fails for any reason, we still try to insert the new value
+            pass
+    return insert_fact(name=name, value=value, uri=uri)
 
-    # Use a VALUES template that casts the embedding param to ::vector
-    template = "(%s, %s, %s, %s::vector, %s)"
 
-    execute_values(
-        cur,
-        """
-        INSERT INTO corah_store.chunks
-            (doc_id, chunk_no, content, embedding, token_count)
-        VALUES %s
-        """,
-        prepared,
-        template=template,
-        page_size=1000,
-    )
+def delete_facts_by_names(names: Sequence[str]) -> None:
+    if not names:
+        return
+    with pg_cursor() as cur:
+        cur.execute("DELETE FROM corah_store.facts WHERE name = ANY(%s);", (list(names),))
+
+
+# -----------------------------
+# Utilities for ingestion flows
+# -----------------------------
+
+def begin_rebuild() -> None:
+    """
+    Optional convenience for ingest --rebuild flows:
+    ensure schema and wipe existing docs/chunks (facts left intact).
+    """
+    ensure_schema()
+    delete_all_documents_and_chunks()
