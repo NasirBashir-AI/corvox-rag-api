@@ -70,10 +70,10 @@ LIMIT %(limit)s;
 
 SQL_FACTS_SELECT_BY_NAMES = """
 SELECT
-    name,
-    value,
-    uri,
-    updated_at
+  name,
+  value,
+  uri,
+  updated_at
 FROM corah_store.facts
 WHERE name = ANY (%(names)s)
 ORDER BY updated_at DESC, name ASC;
