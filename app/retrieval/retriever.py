@@ -10,7 +10,7 @@ Thin retrieval facade used by the API and generator.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Sequence, Tuple, Optional
 
 from app.core.config import DB_URL, RETRIEVAL_TOP_K
 from app.core.utils import pg_cursor, rows_to_dicts
@@ -54,23 +54,35 @@ def top_similarity(hits: Sequence[Dict[str, Any]]) -> float:
     return max(float(h.get("score") or 0.0) for h in hits)
 
 
-def make_context(hits: Sequence[Dict[str, Any]], max_chars: int = 2000) -> str:
+def make_context(
+    hits: Sequence[Dict[str, Any]],
+    max_chars: int = 2000,
+) -> Tuple[str, Optional[List[Dict[str, str]]]]:
     """
-    Join hits into a single context string. Keeps things simple and compact.
+    Join hits into a single context string and also return lightweight citations.
+    Returns: (context_text, citations or None)
     """
     parts: List[str] = []
+    citations: List[Dict[str, str]] = []
+
     for i, h in enumerate(hits, 1):
         title = h.get("title") or f"Document {h.get('document_id', i)}"
         content = h.get("content") or ""
-        source = h.get("source_uri") or ""
+        source = (h.get("source_uri") or "").strip()
+
         block = f"## {title}\n{content}"
         if source:
             block += f"\n\n(SOURCE: {source})"
+            citations.append({"title": title, "uri": source})
+
         parts.append(block.strip())
+
+        # stop when we’re at/over the budget
         if sum(len(p) for p in parts) >= max_chars:
             break
+
     ctx = "\n\n---\n\n".join(parts).strip()
-    # Trim to hard cap if necessary
     if len(ctx) > max_chars:
         ctx = ctx[: max_chars - 1].rstrip() + "…"
-    return ctx
+
+    return ctx, (citations if citations else None)
