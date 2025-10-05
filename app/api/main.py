@@ -112,11 +112,11 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         facts = get_facts(names)
         if facts:
             if intent == "contact":
-                # Compose a concise contact line using whatever we have
-                email = next((f["value"] for f in facts if f.get("name") == "contact_email"), None)
-                phone = next((f["value"] for f in facts if f.get("name") == "contact_phone"), None)
-                url   = next((f["value"] for f in facts if f.get("name") == "contact_url"), None)
-                addr  = next((f["value"] for f in facts if f.get("name") == "office_address"), None)
+                # facts is a dict: {name: value}
+                email = facts.get("contact_email")
+                phone = facts.get("contact_phone")
+                url   = facts.get("contact_url")
+                addr  = facts.get("office_address")
 
                 parts = []
                 if email: parts.append(f"Email: {email}")
@@ -127,18 +127,20 @@ def api_chat(req: ChatRequest) -> ChatResponse:
                     parts.append("You can reach Corvox via the contact details on our website.")
 
                 return ChatResponse(answer=" | ".join(parts))
+
             else:
                 # pricing
-                bullets = [f["value"] for f in facts if f.get("name") == "pricing_bullet" and f.get("value")]
-                overview = next((f["value"] for f in facts if f.get("name") == "pricing_overview"), None)
-                if bullets:
-                    top = bullets[:3]
-                    joined = " • ".join(top)
-                    prefix = overview + " — " if overview else ""
+                bullets_val = facts.get("pricing_bullet")       # string or None
+                overview    = facts.get("pricing_overview")     # string or None
+
+                # Show at most one “bullet” string if present (safe even if it’s a single string)
+                top = [bullets_val] if bullets_val else []
+                joined = " • ".join(top) if top else ""
+
+                if overview or joined:
+                    prefix = f"{overview} — " if overview else ""
                     return ChatResponse(answer=f"{prefix}{joined}")
-                if overview:
-                    return ChatResponse(answer=overview)
-                # else fall through to generator
+                # otherwise fall through to generator
 
     # 3) Default: generate with RAG (never deflect)
     result = generate_answer(

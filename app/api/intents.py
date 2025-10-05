@@ -28,8 +28,19 @@ _SMALLTALK_PATTERNS = [
 ]
 
 _CONTACT_KEYWORDS = [
-    "contact", "get in touch", "reach you", "email", "mail", "phone",
-    "telephone", "call", "number", "address", "office", "location",
+    r"\bcontact\b",
+    r"\bget in touch\b",
+    r"\breach (?:you|out)\b",                 # "reach you" / "reach out"
+    r"\bemail(?:\s+address)?\b",             # "email" / "email address"
+    r"\be-?mail(?:\s+address)?\b",           # "e-mail" / "e mail address"
+    r"\bphone(?:\s+number)?\b",              # "phone" / "phone number"
+    r"\bcall\b",                             # "can I call?"
+    r"\bnumber\b",                           # "your number" (kept broad, but fine)
+    r"\baddress\b",                          # "what is your address"
+    r"\bwhere (?:are you )?based\b",         # "where are you based?"
+    r"\blocat(?:ion|ed)\b",                  # "location" / "located"
+    r"\boffice\b",                           # "office address"
+    r"\bwebsite\b|\bsite\b|\burl\b",         # "website / url"
 ]
 
 _PRICING_KEYWORDS = [
