@@ -53,7 +53,7 @@ def get_facts(names: Sequence[str], db_url: Optional[str] = None) -> Dict[str, s
         #   FROM corah_store.facts
         #   WHERE name = ANY(%s)
         #   ORDER BY name;
-        cur.execute(SQL_FACTS_SELECT_BY_NAMES, (uniq,))
+        cur.execute(SQL_FACTS_SELECT_BY_NAMES, {"names": uniq})
         rows: List[Dict[str, Any]] = rows_to_dicts(cur)
 
     facts: Dict[str, str] = {}
