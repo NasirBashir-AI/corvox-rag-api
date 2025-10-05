@@ -10,7 +10,7 @@ Thin retrieval facade used by the API and generator.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence, Tuple, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from app.core.config import DB_URL, RETRIEVAL_TOP_K
 from app.core.utils import pg_cursor, rows_to_dicts
@@ -33,15 +33,36 @@ def search(query: str, k: Optional[int] = None) -> List[Dict[str, Any]]:
 # -----------------------------
 # Structured facts (contact/pricing)
 # -----------------------------
-def get_facts(names: Sequence[str]) -> Dict[str, str]:
+def get_facts(names: Sequence[str], db_url: Optional[str] = None) -> Dict[str, str]:
+    """
+    Fetch named structured facts as a dict {name: value}.
+    Uses rows_to_dicts to avoid tuple indexing errors.
+    """
     if not names:
         return {}
-    placeholders = ",".join(["%s"] * len(names))
-    sql = SQL_FACTS_SELECT_BY_NAMES.format(placeholders=placeholders)
-    with pg_cursor(DB_URL) as cur:
-        cur.execute(sql, tuple(names))
-        rows = rows_to_dicts(cur)
-    return {r["name"]: r["value"] for r in rows if r.get("value")}
+
+    # De-duplicate & keep order stable
+    uniq = list(dict.fromkeys([n for n in names if n]))
+
+    if not uniq:
+        return {}
+
+    with pg_cursor(db_url) as cur:
+        # SQL_FACTS_SELECT_BY_NAMES should be like:
+        #   SELECT name, value, uri, updated_at
+        #   FROM corah_store.facts
+        #   WHERE name = ANY(%s)
+        #   ORDER BY name;
+        cur.execute(SQL_FACTS_SELECT_BY_NAMES, (uniq,))
+        rows: List[Dict[str, Any]] = rows_to_dicts(cur)
+
+    facts: Dict[str, str] = {}
+    for r in rows:
+        n = r.get("name")
+        v = r.get("value")
+        if n is not None and v is not None:
+            facts[str(n)] = str(v)
+    return facts
 
 
 # -----------------------------
