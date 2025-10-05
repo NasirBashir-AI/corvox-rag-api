@@ -1,142 +1,174 @@
 # app/retrieval/scoring.py
 """
-Thin hybrid retrieval engine:
-- vector search (pgvector) + Postgres FTS
-- score blending with simple normalization
-- returns unified hit shape for the retriever API
+Hybrid retrieval (vector + FTS) with a tiny, robust surface:
+- Always return rows as dicts (via rows_to_dicts) to avoid tuple indexing errors
+- Minimal SQL with proper ::vector cast to fix earlier type errors
+- Simple score blending with alpha
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Sequence, Tuple
+from collections import defaultdict
 
 from openai import OpenAI
 
-from app.core.config import EMBEDDING_MODEL
-from app.core.utils import pg_cursor, rows_to_dicts, soft_normalize
-from app.retrieval.sql import SQL_VECTOR_SEARCH, SQL_FTS_SEARCH
-
-_client = OpenAI()  # uses OPENAI_API_KEY from env
-
+from app.core.config import (
+    EMBEDDING_MODEL,
+    RETRIEVAL_TOP_K,
+)
+from app.core.utils import pg_cursor, rows_to_dicts, soft_normalize, clamp
 
 # -----------------------------
-# Embedding helper
+# OpenAI client (reads OPENAI_API_KEY from env)
 # -----------------------------
-def _embed_query(text: str) -> List[float]:
-    """Return the embedding vector for a query string."""
-    resp = _client.embeddings.create(model=EMBEDDING_MODEL, input=text)
-    return list(resp.data[0].embedding)
+_client = OpenAI()
 
-
+# -----------------------------
+# Small helpers
+# -----------------------------
 def _to_vector_literal(embedding: Sequence[float]) -> str:
-    """Format a Python list[float] as a Postgres vector literal: '[0.1, -0.2, ...]'."""
+    # Postgres vector extension accepts e.g. '[0.1,0.2,0.3]'
     return "[" + ",".join(f"{x:.8f}" for x in embedding) + "]"
 
 
+def _embed_query(query: str) -> List[float]:
+    resp = _client.embeddings.create(model=EMBEDDING_MODEL, input=query)
+    return list(resp.data[0].embedding)
+
+
 # -----------------------------
-# DB search helpers
+# SQL helpers (kept inline to avoid import drift)
 # -----------------------------
+_SQL_VECTOR = """
+SELECT
+  d.id     AS document_id,
+  d.title  AS title,
+  d.source_uri AS source_uri,
+  c.id     AS chunk_id,
+  c.chunk_no AS chunk_no,
+  c.content AS content,
+  /* cosine distance (pgvector) -> similarity */
+  1 - (c.embedding <=> (%s)::vector) AS score
+FROM corah_store.chunks c
+JOIN corah_store.documents d ON d.id = c.document_id
+ORDER BY c.embedding <=> (%s)::vector
+LIMIT %s;
+"""
+
+_SQL_FTS = """
+WITH q AS (
+  SELECT websearch_to_tsquery('english', %s) AS query
+)
+SELECT
+  d.id     AS document_id,
+  d.title  AS title,
+  d.source_uri AS source_uri,
+  c.id     AS chunk_id,
+  c.chunk_no AS chunk_no,
+  c.content AS content,
+  ts_rank(c.content_tsv, q.query) AS score
+FROM corah_store.chunks c
+JOIN corah_store.documents d ON d.id = c.document_id, q
+WHERE c.content_tsv @@ q.query
+ORDER BY score DESC
+LIMIT %s;
+"""
+
+
 def _vector_search(db_url: str, embedding: Sequence[float], k: int) -> List[Dict[str, Any]]:
     """
-    Return top-k chunks ordered by cosine similarity (via distance `<=>` cast to ::vector).
-    We convert distance to similarity in SQL: 1 - distance.
+    Return top-k chunks ordered by cosine distance (<=>).
+    We cast the parameter to ::vector to avoid 'operator does not exist: vector <=> numeric' errors.
     """
     vec_txt = _to_vector_literal(embedding)
-    sql = SQL_VECTOR_SEARCH  # see app/retrieval/sql.py
-
     with pg_cursor(db_url) as cur:
-        cur.execute(sql, (vec_txt, vec_txt, k))
-        return rows_to_dicts(cur)
+        cur.execute(_SQL_VECTOR, (vec_txt, vec_txt, k))
+        return rows_to_dicts(cur)  # <-- ensures dicts, not tuples
 
 
 def _fts_search(db_url: str, query: str, k: int) -> List[Dict[str, Any]]:
-    """
-    Return top-k chunks by Postgres full-text search with websearch_to_tsquery.
-    """
     with pg_cursor(db_url) as cur:
-        cur.execute(SQL_FTS_SEARCH, (query, k))
-        return rows_to_dicts(cur)
+        cur.execute(_SQL_FTS, (query, k))
+        return rows_to_dicts(cur)  # <-- ensures dicts, not tuples
 
 
 # -----------------------------
-# Hybrid combiner
+# Public: hybrid retrieval
 # -----------------------------
 def hybrid_retrieve(
-    *,
+    db_url: str,
     query: str,
     k: int,
-    alpha: float = 0.6,  # blend weight: 0..1 (higher = more vector influence)
-    db_url: str | None = None,
+    alpha: float = 0.60,  # blend weight: vector (alpha) vs FTS (1 - alpha)
 ) -> List[Dict[str, Any]]:
     """
-    Run vector and FTS searches, normalize their scores to 0..1, then blend:
-        blended = alpha * vec_norm + (1 - alpha) * fts_norm
-    Return top-k combined results in a unified shape.
-
-    Output keys per hit:
-      - document_id: int
-      - chunk_id: int
-      - chunk_no: int
-      - title: str|None
-      - source_uri: str|None
-      - content: str
-      - score: float (0..1)
+    Returns a unified list of hits with keys:
+      document_id, title, source_uri, chunk_id, chunk_no, content, score
     """
-    if db_url is None:
-        # Let pg_cursor() read DB_URL from env
-        from app.core.utils import getenv_str
-        db_url = getenv_str("DB_URL")
-        if not db_url:
-            raise RuntimeError("DB_URL is not set")
+    alpha = clamp(alpha, 0.0, 1.0)
+    k = max(1, int(k))
 
-    # 1) Embed query + get both result lists
-    vec = _embed_query(query)
-    vec_hits = _vector_search(db_url, vec, k)
-    fts_hits = _fts_search(db_url, query, k)
+    # 1) Embed the query
+    embedding = _embed_query(query)
 
-    # 2) Normalize each list’s score to 0..1 independently
-    vec_scores = [h.get("score", 0.0) for h in vec_hits]
-    fts_scores = [h.get("score", 0.0) for h in fts_hits]
-    vec_norm = soft_normalize(vec_scores)
-    fts_norm = soft_normalize(fts_scores)
+    # 2) Run searches (both return list[dict])
+    vec_hits = _vector_search(db_url=db_url, embedding=embedding, k=k * 2)  # widen a bit before blend
+    fts_hits = _fts_search(db_url=db_url, query=query, k=k * 2)
 
-    # 3) Index by (document_id, chunk_id)
-    def key_of(h: Dict[str, Any]) -> Tuple[int, int]:
-        return int(h["document_id"]), int(h["chunk_id"])
+    # 3) Normalize scores to 0..1 (robust even if all equal)
+    v_scores = [float(h.get("score", 0.0) or 0.0) for h in vec_hits]
+    f_scores = [float(h.get("score", 0.0) or 0.0) for h in fts_hits]
+    v_norm = soft_normalize(v_scores)
+    f_norm = soft_normalize(f_scores)
 
-    vec_map: Dict[Tuple[int, int], float] = {}
-    for h, s in zip(vec_hits, vec_norm):
-        vec_map[key_of(h)] = s
+    # index by chunk_id for blending
+    by_chunk: Dict[int, Dict[str, Any]] = {}
 
-    fts_map: Dict[Tuple[int, int], float] = {}
-    for h, s in zip(fts_hits, fts_norm):
-        fts_map[key_of(h)] = s
-
-    # 4) Merge keys and compute blended score
-    all_keys = set(vec_map.keys()) | set(fts_map.keys())
-
-    merged: Dict[Tuple[int, int], Dict[str, Any]] = {}
-    # Prefer vector row shape if present, else FTS row shape
-    base_rows: Dict[Tuple[int, int], Dict[str, Any]] = {
-        key_of(h): h for h in vec_hits + fts_hits
-    }
-
-    for kkey in all_keys:
-        base = base_rows[kkey]
-        v = vec_map.get(kkey, 0.0)
-        t = fts_map.get(kkey, 0.0)
-        blended = alpha * v + (1.0 - alpha) * t
-
-        merged[kkey] = {
-            "document_id": base["document_id"],
-            "chunk_id": base["chunk_id"],
-            "chunk_no": base.get("chunk_no"),
-            "title": base.get("title"),
-            "source_uri": base.get("source_uri"),
-            "content": base.get("content"),
-            "score": float(blended),
+    for h, s in zip(vec_hits, v_norm):
+        cid = int(h["chunk_id"])
+        by_chunk[cid] = {
+            "document_id": int(h["document_id"]),
+            "title": h.get("title"),
+            "source_uri": h.get("source_uri"),
+            "chunk_id": cid,
+            "chunk_no": int(h.get("chunk_no") or 0),
+            "content": h.get("content") or "",
+            "vec": float(s),
+            "fts": 0.0,
         }
 
-    # 5) Sort by blended score desc and return top-k
-    results = sorted(merged.values(), key=lambda h: h["score"], reverse=True)
-    return results[:k]
+    for h, s in zip(fts_hits, f_norm):
+        cid = int(h["chunk_id"])
+        if cid not in by_chunk:
+            by_chunk[cid] = {
+                "document_id": int(h["document_id"]),
+                "title": h.get("title"),
+                "source_uri": h.get("source_uri"),
+                "chunk_id": cid,
+                "chunk_no": int(h.get("chunk_no") or 0),
+                "content": h.get("content") or "",
+                "vec": 0.0,
+                "fts": float(s),
+            }
+        else:
+            by_chunk[cid]["fts"] = float(s)
+
+    # 4) Blend and sort
+    blended: List[Dict[str, Any]] = []
+    for item in by_chunk.values():
+        score = alpha * item["vec"] + (1.0 - alpha) * item["fts"]
+        blended.append(
+            {
+                "document_id": item["document_id"],
+                "title": item["title"],
+                "source_uri": item["source_uri"],
+                "chunk_id": item["chunk_id"],
+                "chunk_no": item["chunk_no"],
+                "content": item["content"],
+                "score": float(score),
+            }
+        )
+
+    blended.sort(key=lambda x: x["score"], reverse=True)
+    return blended[:k]
