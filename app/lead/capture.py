@@ -1,119 +1,122 @@
 # app/lead/capture.py
-from __future__ import annotations
-import re, uuid, json
-from typing import Dict, Optional
-from app.core.config import DB_URL
-from app.core.utils import pg_cursor
 
-EMAIL_RE  = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
-PHONE_RE  = re.compile(r"(\+?\d[\d\s().-]{7,}\d)")
-NAME_RE   = re.compile(r"\b(i'?m|i am|this is)\s+([A-Za-z][A-Za-z\-\' ]{1,40})", re.I)
+from typing import Optional, Dict, Any
+from app.core.session_mem import get_state, set_state
 
-def harvest_email(text: str) -> Optional[str]:
-    m = EMAIL_RE.search(text or "")
-    return m.group(0) if m else None
+# You already have these in this file:
+# EMAIL_RE, PHONE_RE, NAME_RE
+# def harvest_email(text: str) -> Optional[str]: ...
+# def harvest_phone(text: str) -> Optional[str]: ...
+# def harvest_name(text: str) -> Optional[str]: ...
 
-def harvest_phone(text: str) -> Optional[str]:
-    m = PHONE_RE.search(text or "")
-    return m.group(0).strip() if m else None
+FLOW_KEY = "lead_flow"      # holds "idle"|"active"
+STAGE_KEY = "lead_stage"    # "lead_name"|"lead_contact"|"lead_time"|"lead_notes"
 
-def harvest_name(text: str) -> Optional[str]:
-    t = (text or "").strip()
-    m = NAME_RE.search(t)
-    if not m:
-        return None
-    # group(2) is the actual name in your pattern (group 1 is "i'm / i am / this is")
-    raw = m.group(2).strip()
-    # neat title-case that preserves apostrophes/dashes reasonably
-    parts = re.split(r"\s+", raw)
-    return " ".join(p[:1].upper() + p[1:].lower() for p in parts)
+def _state(sid: str) -> Dict[str, Any]:
+    return get_state(sid) or {}
 
-# in-memory flow per session
-_SESS: Dict[str, Dict] = {}
+def _set(sid: str, **kv) -> None:
+    cur = _state(sid)
+    cur.update(kv)
+    set_state(sid, **cur)
 
 def in_progress(session_id: str) -> bool:
-    return session_id in _SESS
+    st = _state(session_id)
+    return st.get(FLOW_KEY) == "active" and st.get(STAGE_KEY) in {
+        "lead_name", "lead_contact", "lead_time", "lead_notes"
+    }
 
 def start(session_id: str, kind: str = "callback") -> str:
-    _SESS[session_id] = {
-        "id": "LEAD-" + uuid.uuid4().hex[:8].upper(),
-        "kind": kind,                      # 'callback' / 'demo' / 'consult'
-        "stage": "name",                   # name -> contact -> time -> notes -> done
-        "data": {}
-    }
-    return "Great — I can arrange that. What’s your name?"
-
-def _extract_name(text: str) -> Optional[str]:
-    m = NAME_RE.search(text)
-    return (m.group(2).strip() if m else None) or (text.strip() if 1 <= len(text.split()) <= 5 else None)
-
-def _extract_email(text: str) -> Optional[str]:
-    m = EMAIL_RE.search(text)
-    return m.group(0) if m else None
-
-def _extract_phone(text: str) -> Optional[str]:
-    m = PHONE_RE.search(text)
-    return m.group(0) if m else None
-
-def take_turn(session_id: str, text: str) -> str:
-    s = _SESS.get(session_id)
-    if not s:
-        return start(session_id)
-
-    st = s["stage"]
-    d  = s["data"]
-
-    if st == "name":
-        n = _extract_name(text)
-        if not n:
-            return "Could you share your name (e.g., “I’m Sam Patel”)?"
-        d["name"] = n
-        s["stage"] = "contact"
-        return f"Thanks, {n}. What’s the best email or phone to reach you?"
-
-    if st == "contact":
-        em, ph = _extract_email(text), _extract_phone(text)
-        if em: d["email"] = em
-        if ph: d["phone"] = ph
-        if not (em or ph):
-            return "I didn’t catch a valid email or phone. Please share one of them."
-        s["stage"] = "time"
-        return "When is a good time (and timezone) for us to contact you?"
-
-    if st == "time":
-        d["time_pref"] = text.strip()
-        s["stage"] = "notes"
-        return "Got it. Any extra context about your needs? (optional)"
-
-    if st == "notes":
-        if text.strip():
-            d["notes"] = text.strip()
-        s["stage"] = "done"
-        _save(session_id, s)
-        lead_id = s["id"]
-        _SESS.pop(session_id, None)
-        return f"All set! I’ve logged your request ({lead_id}). We’ll contact you shortly. Anything else I can help with?"
-
-    # fallback
-    return "Let me just confirm—could you share your name?"
-
-def _save(session_id: str, s: Dict) -> None:
-    payload = {
-        "lead_id": s["id"],
-        "session_id": session_id,
-        "kind": s["kind"],
-        **s["data"]
-    }
-    sql = """
-    CREATE TABLE IF NOT EXISTS corah_store.leads(
-      id BIGSERIAL PRIMARY KEY,
-      session_id TEXT,
-      source TEXT DEFAULT 'chat',
-      payload JSONB NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT now()
-    );
-    INSERT INTO corah_store.leads(session_id, payload)
-    VALUES (%s, %s::jsonb);
     """
-    with pg_cursor(DB_URL) as cur:
-        cur.execute(sql, (session_id, json.dumps(payload)))
+    Start or resume the lead flow from the *first missing piece*.
+    """
+    st = _state(session_id)
+    name  = st.get("name")
+    phone = st.get("phone")
+    email = st.get("email")
+
+    _set(session_id, **{FLOW_KEY: "active"})  # mark active
+
+    if not name:
+        _set(session_id, **{STAGE_KEY: "lead_name"})
+        return "Got it. May I take your name?"
+    if not (phone or email):
+        _set(session_id, **{STAGE_KEY: "lead_contact"})
+        pre = f"Thanks {name}. " if name else ""
+        return pre + "What’s the best phone number for a callback? You can also share an email."
+    # (Optional) preferred time
+    if not st.get("preferred_time"):
+        _set(session_id, **{STAGE_KEY: "lead_time"})
+        return "When is a good time for us to contact you?"
+    # (Optional) notes/context
+    if not st.get("notes"):
+        _set(session_id, **{STAGE_KEY: "lead_notes"})
+        return "Any extra context about your needs?"
+
+    # If everything is already present, we’re done.
+    _set(session_id, **{FLOW_KEY: "idle", STAGE_KEY: None})
+    return "Thanks, I’ve got the details. We’ll be in touch shortly."
+
+def take_turn(session_id: str, user_text: str) -> str:
+    """
+    Handle the current lead stage; harvest any details we can from the message,
+    update memory, then decide the next prompt.
+    """
+    st = _state(session_id)
+
+    # Always try to harvest on every turn (so we don’t re-ask)
+    name  = harvest_name(user_text)   or st.get("name")
+    phone = harvest_phone(user_text)  or st.get("phone")
+    email = harvest_email(user_text)  or st.get("email")
+
+    changed = {}
+    if name and name != st.get("name"):
+        changed["name"] = name
+    if phone and phone != st.get("phone"):
+        changed["phone"] = phone
+    if email and email != st.get("email"):
+        changed["email"] = email
+    if changed:
+        _set(session_id, **changed)
+
+    stage = _state(session_id).get(STAGE_KEY)
+
+    # Progress the flow based on what we have now
+    if stage == "lead_name":
+        if not _state(session_id).get("name"):
+            return "Got it. May I take your name?"
+        # advance
+        _set(session_id, **{STAGE_KEY: "lead_contact"})
+        return f"Thanks {name}. What’s the best phone number for a callback? You can also share an email."
+
+    if stage == "lead_contact":
+        have_contact = _state(session_id).get("phone") or _state(session_id).get("email")
+        if not have_contact:
+            return "What’s the best phone number for a callback? You can also share an email."
+        _set(session_id, **{STAGE_KEY: "lead_time"})
+        return "When is a good time for us to contact you?"
+
+    if stage == "lead_time":
+        # You can add a real time parser later; for now just store the raw text.
+        if user_text.strip():
+            _set(session_id, preferred_time=user_text.strip())
+        if not _state(session_id).get("preferred_time"):
+            return "When is a good time for us to contact you?"
+        _set(session_id, **{STAGE_KEY: "lead_notes"})
+        return "Any extra context about your needs?"
+
+    if stage == "lead_notes":
+        if user_text.strip():
+            _set(session_id, notes=user_text.strip())
+        _set(session_id, **{FLOW_KEY: "idle", STAGE_KEY: None})
+        person = _state(session_id).get("name")
+        if _state(session_id).get("phone") and _state(session_id).get("email"):
+            return f"Thanks {person}. I’ve noted your phone and email. We’ll be in touch shortly."
+        if _state(session_id).get("phone"):
+            return f"Thanks {person}. I’ve got your phone number. We’ll call you shortly."
+        if _state(session_id).get("email"):
+            return f"Thanks {person}. I’ve noted your email."
+        return "Thanks, I’ve got the details. We’ll be in touch shortly."
+
+    # If we ever land here, re-run start() to pick the right step.
+    return start(session_id, kind="callback")
