@@ -72,6 +72,18 @@ _SERVICES_KEYWORDS = [
     "solutions", "offerings", "products", "what you offer", "use cases", "areas you cover"
 ]
 
+_LEAD_KEYWORDS = [
+    # booking / callback
+    "callback", "call back", "book a call", "schedule a call", "arrange a call",
+    "speak to someone", "talk to a human", "demo", "book a demo",
+    # conversion-y intents
+    "next step", "get started", "i want to take your services", "sign up",
+    "quote", "consultation"
+]
+
+_RE_LEAD = _compile_keywords(_LEAD_KEYWORDS)
+
+
 def _contact_focus(q: str) -> str:
     """Return which contact detail the user is asking for."""
     if re.search(r"\b(e-?mail|email)\b", q, re.IGNORECASE):
@@ -112,25 +124,19 @@ _RE_SMALLTALK = [re.compile(p, re.IGNORECASE) for p in _SMALLTALK_PATTERNS]
 # -----------------------------
 
 def detect_intent(text: str) -> Tuple[str, Optional[str]]:
-    """
-    Classify a user message into one of:
-      - 'smalltalk'  (returns a polite reply string as second value)
-      - 'contact'
-      - 'pricing'
-      - 'services'
-      - 'other'
-    """
     q = normalize_ws(text or "")
 
-    # 1) Smalltalk first: quick win, no retrieval
+    # smalltalk first
     for rx in _RE_SMALLTALK:
         if rx.search(q):
             return "smalltalk", smalltalk_reply(q)
 
-    # 2) Contact / Pricing / Services (fast keyword checks)
+    # NEW: lead before generic services
+    if _RE_LEAD.search(q):
+        return "lead", None
+
     if _RE_CONTACT.search(q):
         return "contact", _contact_focus(q)
-    # Extra safety net: explicit regexes for common phrasings
     for rx in _CONTACT_PATTERNS:
         if rx.search(q):
             return "contact", None
@@ -140,7 +146,6 @@ def detect_intent(text: str) -> Tuple[str, Optional[str]]:
     if _RE_SERVICES.search(q):
         return "services", None
 
-    # 3) Fallback
     return "other", None
 
 def smalltalk_reply(text: str) -> str:
