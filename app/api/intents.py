@@ -14,18 +14,6 @@ from typing import Optional, Tuple
 from app.lead.capture import harvest_email, harvest_phone, harvest_name
 from app.core.utils import normalize_ws
 
-q = normalize_ws(text or "")
-
-# If the user message contains contact details, route to the structured path.
-# This prevents the LLM branch from ever seeing phone/email and “refusing”.
-if harvest_email(q) or harvest_phone(q):
-    return "contact", None
-
-# If they only gave a name, treat it as “lead” so the capture flow can continue.
-if harvest_name(q):
-    return "lead", None
-
-
 # -----------------------------
 # Keyword lexicons (compact)
 # -----------------------------
@@ -134,6 +122,15 @@ _RE_LEAD = _compile_keywords(_LEAD_KEYWORDS)
 
 def detect_intent(text: str) -> Tuple[str, Optional[str]]:
     q = normalize_ws(text or "")
+
+    # If the user message contains contact details, route to the structured path.
+    # This prevents the LLM branch from ever seeing phone/email and “refusing”.
+    if harvest_email(q) or harvest_phone(q):
+        return "contact", None
+
+    # If they only gave a name, treat it as “lead” so the capture flow can continue.
+    if harvest_name(q):
+        return "lead", None
 
     # smalltalk first
     for rx in _RE_SMALLTALK:
