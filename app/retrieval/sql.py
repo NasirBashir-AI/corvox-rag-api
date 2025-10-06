@@ -75,7 +75,7 @@ SELECT
   uri,
   updated_at
 FROM corah_store.facts
-WHERE name = ANY (%(names)s)
+WHERE name = ANY (%(names)s::text[])
 ORDER BY updated_at DESC, name ASC;
 """
 
