@@ -13,7 +13,7 @@ Lead summary helpers (if used in your flows) remain here as well.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Sequence, Tuple, Optional
 
 from openai import OpenAI
 

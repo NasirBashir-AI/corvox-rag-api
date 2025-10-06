@@ -1,4 +1,12 @@
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+from app.core.config import DB_URL, RETRIEVAL_TOP_K
+from app.core.utils import pg_cursor, rows_to_dicts
+from app.retrieval.scoring import hybrid_retrieve
+from app.retrieval.sql import SQL_FACTS_SELECT_BY_NAMES
+
 # app/retrieval/retriever.py
+
 """
 Thin retrieval facade used by the API and generator.
 
@@ -7,16 +15,6 @@ Thin retrieval facade used by the API and generator.
 - top_similarity(hits)  -> best score across hits (compat for generator)
 - make_context(hits)    -> join hits into a single context string (compat)
 """
-
-from __future__ import annotations
-
-from typing import Any, Dict, List, Optional, Sequence
-
-from app.core.config import DB_URL, RETRIEVAL_TOP_K
-from app.core.utils import pg_cursor, rows_to_dicts
-from app.retrieval.scoring import hybrid_retrieve
-from app.retrieval.sql import SQL_FACTS_SELECT_BY_NAMES
-
 
 # -----------------------------
 # Public search API

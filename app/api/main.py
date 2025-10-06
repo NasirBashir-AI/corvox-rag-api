@@ -100,81 +100,87 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     if not q:
         raise HTTPException(status_code=400, detail="empty_question")
 
-    intent, smalltalk = detect_intent(q)
+    # NOTE:
+    # detect_intent(q) returns:
+    #  - ("smalltalk", <reply_str>) for smalltalk
+    #  - ("contact", <focus or "generic">) for contact
+    #  - ("pricing"|"services"|"other", None) otherwise
+    intent, aux = detect_intent(q)
 
     # 1) Smalltalk short-circuit
-    if intent == "smalltalk" and ENABLE_SMALLTALK and smalltalk:
-        return ChatResponse(answer=smalltalk)
+    if intent == "smalltalk" and ENABLE_SMALLTALK and aux:
+        return ChatResponse(answer=aux)
 
-    # 2) Facts-first for contact/pricing
+    # 2) Facts-first for contact or pricing
     if intent in ("contact", "pricing") and ENABLE_FACTS:
-        names = ["contact_email", "contact_phone", "contact_url", "office_address"] if intent == "contact" else ["pricing_bullet", "pricing_overview"]
-        facts = get_facts(names)
-        if facts:
-           if intent == "contact":
-                # second value from detect_intent now carries the focus (email/phone/address/url/generic)
-                _intent, focus = detect_intent(q)
+        if intent == "contact":
+            # Determine which facts to fetch based on focus
+            focus = (aux or "generic").lower()
 
-                # Decide which facts to fetch based on the focus
-                if focus == "email":
-                    names = ["contact_email"]
-                elif focus == "phone":
-                    names = ["contact_phone"]
-                elif focus == "address":
-                    names = ["office_address"]
-                elif focus == "url":
-                    names = ["contact_url"]
-                else:  # generic contact
-                    names = ["contact_email", "contact_phone", "contact_url", "office_address"]
-
-                facts = get_facts(names)
-                if facts:
-                    email = facts.get("contact_email")
-                    phone = facts.get("contact_phone")
-                    url   = facts.get("contact_url")
-                    addr  = facts.get("office_address")
-
-                    # Focused, natural sentences
-                    if focus == "email" and email:
-                        return ChatResponse(answer=f"You can email us at {email}.")
-                    if focus == "phone" and phone:
-                        return ChatResponse(answer=f"You can call us on {phone}.")
-                    if focus == "address" and addr:
-                        return ChatResponse(answer=f"We’re based at {addr}.")
-                    if focus == "url" and url:
-                        return ChatResponse(answer=f"Our website is {url}.")
-
-                    # Generic contact: include whatever exists, phrased nicely
-                    parts = []
-                    if email: parts.append(f"email ({email})")
-                    if phone: parts.append(f"phone")
-                    if url:   parts.append(f"our website: {url}")
-                    if addr:  parts.append(f"our office: {addr}")
-
-                    if parts:
-                        # e.g., "You can contact us via email (x), phone, or our website: y. Our office: …"
-                        if len(parts) == 1:
-                            return ChatResponse(answer=f"You can contact us via {parts[0]}.")
-                        else:
-                            lead, last = ", ".join(parts[:-1]), parts[-1]
-                            return ChatResponse(answer=f"You can contact us via {lead}, or {last}.")
-
-                    # If we have no facts at all, fall back politely
-                    return ChatResponse(answer="You can reach us through our website or messaging channels.")
-
+            if focus == "email":
+                names = ["contact_email"]
+            elif focus == "phone":
+                names = ["contact_phone"]
+            elif focus == "address":
+                names = ["office_address"]
+            elif focus == "url":
+                names = ["contact_url"]
             else:
-                # pricing
-                bullets_val = facts.get("pricing_bullet")       # string or None
-                overview    = facts.get("pricing_overview")     # string or None
+                names = ["contact_email", "contact_phone", "contact_url", "office_address"]
 
-                # Show at most one “bullet” string if present (safe even if it’s a single string)
-                top = [bullets_val] if bullets_val else []
-                joined = " • ".join(top) if top else ""
+            facts = get_facts(names)
 
-                if overview or joined:
-                    prefix = f"{overview} — " if overview else ""
-                    return ChatResponse(answer=f"{prefix}{joined}")
-                # otherwise fall through to generator
+            # Build a natural, focused response
+            email = facts.get("contact_email")
+            phone = facts.get("contact_phone")
+            url   = facts.get("contact_url")
+            addr  = facts.get("office_address")
+
+            if focus == "email" and email:
+                return ChatResponse(answer=f"You can email us at {email}.")
+            if focus == "phone" and phone:
+                return ChatResponse(answer=f"You can call us on {phone}.")
+            if focus == "address" and addr:
+                return ChatResponse(answer=f"We’re based at {addr}.")
+            if focus == "url" and url:
+                return ChatResponse(answer=f"Our website is {url}.")
+
+            # Generic contact: include whatever exists, phrased nicely
+            parts = []
+            if email:
+                parts.append(f"email ({email})")
+            if phone:
+                parts.append("phone")
+            if url:
+                parts.append(f"our website: {url}")
+            if addr:
+                parts.append(f"our office: {addr}")
+
+            if parts:
+                if len(parts) == 1:
+                    return ChatResponse(answer=f"You can contact us via {parts[0]}.")
+                else:
+                    lead, last = ", ".join(parts[:-1]), parts[-1]
+                    return ChatResponse(answer=f"You can contact us via {lead}, or {last}.")
+
+            # No facts at all → graceful fallback
+            return ChatResponse(answer="You can reach us through our website or messaging channels.")
+
+        else:
+            # pricing
+            names = ["pricing_bullet", "pricing_overview"]
+            facts = get_facts(names)
+
+            bullets_val = facts.get("pricing_bullet")
+            overview    = facts.get("pricing_overview")
+
+            top = [bullets_val] if bullets_val else []
+            joined = " • ".join(top) if top else ""
+
+            if overview or joined:
+                prefix = f"{overview} — " if overview else ""
+                return ChatResponse(answer=f"{prefix}{joined}")
+            # otherwise fall through to generator
 
     # 3) Default: generate with RAG (never deflect)
     result = generate_answer(
