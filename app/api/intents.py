@@ -81,8 +81,6 @@ _LEAD_KEYWORDS = [
     "quote", "consultation"
 ]
 
-_RE_LEAD = _compile_keywords(_LEAD_KEYWORDS)
-
 
 def _contact_focus(q: str) -> str:
     """Return which contact detail the user is asking for."""
@@ -117,7 +115,7 @@ _RE_CONTACT = _compile_keywords(_CONTACT_KEYWORDS)
 _RE_PRICING = _compile_keywords(_PRICING_KEYWORDS)
 _RE_SERVICES = _compile_keywords(_SERVICES_KEYWORDS)
 _RE_SMALLTALK = [re.compile(p, re.IGNORECASE) for p in _SMALLTALK_PATTERNS]
-
+_RE_LEAD = _compile_keywords(_LEAD_KEYWORDS)
 
 # -----------------------------
 # Public API
