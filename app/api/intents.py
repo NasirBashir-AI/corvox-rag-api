@@ -72,6 +72,17 @@ _SERVICES_KEYWORDS = [
     "solutions", "offerings", "products", "what you offer", "use cases", "areas you cover"
 ]
 
+def _contact_focus(q: str) -> str:
+    """Return which contact detail the user is asking for."""
+    if re.search(r"\b(e-?mail|email)\b", q, re.IGNORECASE):
+        return "email"
+    if re.search(r"\b(phone|number|call)\b", q, re.IGNORECASE):
+        return "phone"
+    if re.search(r"\b(address|location|office|where\s+are\s+you\s+based)\b", q, re.IGNORECASE):
+        return "address"
+    if re.search(r"\b(website|site|url)\b", q, re.IGNORECASE):
+        return "url"
+    return "generic"
 
 # Precompile simple keyword regexes for speed/clarity
 def _compile_keywords(patterns):
@@ -118,7 +129,7 @@ def detect_intent(text: str) -> Tuple[str, Optional[str]]:
 
     # 2) Contact / Pricing / Services (fast keyword checks)
     if _RE_CONTACT.search(q):
-        return "contact", None
+        return "contact", _contact_focus(q)
     # Extra safety net: explicit regexes for common phrasings
     for rx in _CONTACT_PATTERNS:
         if rx.search(q):

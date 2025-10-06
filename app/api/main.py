@@ -111,22 +111,56 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         names = ["contact_email", "contact_phone", "contact_url", "office_address"] if intent == "contact" else ["pricing_bullet", "pricing_overview"]
         facts = get_facts(names)
         if facts:
-            if intent == "contact":
-                # facts is a dict: {name: value}
-                email = facts.get("contact_email")
-                phone = facts.get("contact_phone")
-                url   = facts.get("contact_url")
-                addr  = facts.get("office_address")
+           if intent == "contact":
+                # second value from detect_intent now carries the focus (email/phone/address/url/generic)
+                _intent, focus = detect_intent(q)
 
-                parts = []
-                if email: parts.append(f"Email: {email}")
-                if phone: parts.append(f"Phone: {phone}")
-                if url:   parts.append(f"More: {url}")
-                if addr:  parts.append(f"Office: {addr}")
-                if not parts:
-                    parts.append("You can reach Corvox via the contact details on our website.")
+                # Decide which facts to fetch based on the focus
+                if focus == "email":
+                    names = ["contact_email"]
+                elif focus == "phone":
+                    names = ["contact_phone"]
+                elif focus == "address":
+                    names = ["office_address"]
+                elif focus == "url":
+                    names = ["contact_url"]
+                else:  # generic contact
+                    names = ["contact_email", "contact_phone", "contact_url", "office_address"]
 
-                return ChatResponse(answer=" | ".join(parts))
+                facts = get_facts(names)
+                if facts:
+                    email = facts.get("contact_email")
+                    phone = facts.get("contact_phone")
+                    url   = facts.get("contact_url")
+                    addr  = facts.get("office_address")
+
+                    # Focused, natural sentences
+                    if focus == "email" and email:
+                        return ChatResponse(answer=f"You can email us at {email}.")
+                    if focus == "phone" and phone:
+                        return ChatResponse(answer=f"You can call us on {phone}.")
+                    if focus == "address" and addr:
+                        return ChatResponse(answer=f"We’re based at {addr}.")
+                    if focus == "url" and url:
+                        return ChatResponse(answer=f"Our website is {url}.")
+
+                    # Generic contact: include whatever exists, phrased nicely
+                    parts = []
+                    if email: parts.append(f"email ({email})")
+                    if phone: parts.append(f"phone")
+                    if url:   parts.append(f"our website: {url}")
+                    if addr:  parts.append(f"our office: {addr}")
+
+                    if parts:
+                        # e.g., "You can contact us via email (x), phone, or our website: y. Our office: …"
+                        if len(parts) == 1:
+                            return ChatResponse(answer=f"You can contact us via {parts[0]}.")
+                        else:
+                            lead, last = ", ".join(parts[:-1]), parts[-1]
+                            return ChatResponse(answer=f"You can contact us via {lead}, or {last}.")
+
+                    # If we have no facts at all, fall back politely
+                    return ChatResponse(answer="You can reach us through our website or messaging channels.")
 
             else:
                 # pricing
