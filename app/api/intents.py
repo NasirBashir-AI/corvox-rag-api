@@ -27,44 +27,66 @@ _SMALLTALK_PATTERNS = [
     r"^\s*(ok|okay|cool|great|nice)\s*[!.]?\s*$",
 ]
 
+_CONTACT_PATTERNS = [
+    re.compile(r"\bphone\s*(?:no\.?|number)\b", re.IGNORECASE),
+    re.compile(r"\bemail\s*(?:id|address)\b", re.IGNORECASE),
+    re.compile(r"\bcall\s*-?\s*back\b", re.IGNORECASE),
+    re.compile(r"\bwhere\s+(?:are\s+you\s+)?based\b", re.IGNORECASE),
+    re.compile(r"\bwhats?app\b", re.IGNORECASE),
+]
+
 _CONTACT_KEYWORDS = [
-    r"\bcontact\b",
-    r"\bget in touch\b",
-    r"\breach (?:you|out)\b",                 # "reach you" / "reach out"
-    r"\bemail(?:\s+address)?\b",             # "email" / "email address"
-    r"\be-?mail(?:\s+address)?\b",           # "e-mail" / "e mail address"
-    r"\bphone(?:\s+number)?\b",              # "phone" / "phone number"
-    r"\bcall\b",                             # "can I call?"
-    r"\bnumber\b",                           # "your number" (kept broad, but fine)
-    r"\baddress\b",                          # "what is your address"
-    r"\bwhere (?:are you )?based\b",         # "where are you based?"
-    r"\blocat(?:ion|ed)\b",                  # "location" / "located"
-    r"\boffice\b",                           # "office address"
-    r"\bwebsite\b|\bsite\b|\burl\b",         # "website / url"
+    "contact",
+    "get in touch",
+    "reach you",
+    "reach out",
+    "email",
+    "email address",
+    "email id",
+    "e-mail",
+    "phone",
+    "phone number",
+    "contact number",
+    "call",
+    "call back",
+    "callback",
+    "whatsapp",
+    "address",
+    "where are you based",
+    "where based",
+    "location",
+    "located",
+    "office",
+    "website",
+    "url"
+    # consider "site" only if you want it; it’s broad
 ]
 
 _PRICING_KEYWORDS = [
     "price", "pricing", "cost", "fees", "rates", "plans", "how much",
-    "subscription", "quote", "estimate",
+    "subscription", "quote", "estimate",  "price list", "how much is it", "per month", "budget"
 ]
 
 _SERVICES_KEYWORDS = [
     "services", "what do you do", "what does corvox do", "capabilities",
-    "solutions", "offerings", "products", "what you offer",
+    "solutions", "offerings", "products", "what you offer", "use cases", "areas you cover"
 ]
 
 
 # Precompile simple keyword regexes for speed/clarity
-def _compile_keywords(words):
-    # word boundaries where it makes sense; also allow phrase contains
-    escaped = [re.escape(w) for w in words]
-    # Use alternation; \b around single words; phrases match as substrings
+def _compile_keywords(patterns):
+    """
+    Treat entries as regex fragments. For plain single words, add \b…\b.
+    Leave phrases/regex (those containing spaces or regex tokens) as-is.
+    """
     parts = []
-    for w in escaped:
-        if " " in w:
-            parts.append(w)
+    for p in patterns:
+        # If it already looks like regex (has \, (, [, ?, |, or spaces), keep as-is
+        if any(tok in p for tok in ["\\", "(", "[", "?", "|", " "]):
+            parts.append(p)
         else:
-            parts.append(rf"\b{w}\b")
+            # plain word -> word boundaries
+            parts.append(rf"\b{p}\b")
     return re.compile("|".join(parts), re.IGNORECASE)
 
 
@@ -97,6 +119,11 @@ def detect_intent(text: str) -> Tuple[str, Optional[str]]:
     # 2) Contact / Pricing / Services (fast keyword checks)
     if _RE_CONTACT.search(q):
         return "contact", None
+    # Extra safety net: explicit regexes for common phrasings
+    for rx in _CONTACT_PATTERNS:
+        if rx.search(q):
+            return "contact", None
+
     if _RE_PRICING.search(q):
         return "pricing", None
     if _RE_SERVICES.search(q):
@@ -104,7 +131,6 @@ def detect_intent(text: str) -> Tuple[str, Optional[str]]:
 
     # 3) Fallback
     return "other", None
-
 
 def smalltalk_reply(text: str) -> str:
     """
