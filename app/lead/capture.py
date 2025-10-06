@@ -9,6 +9,25 @@ EMAIL_RE  = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 PHONE_RE  = re.compile(r"(\+?\d[\d\s().-]{7,}\d)")
 NAME_RE   = re.compile(r"\b(i'?m|i am|this is)\s+([A-Za-z][A-Za-z\-\' ]{1,40})", re.I)
 
+def harvest_email(text: str) -> Optional[str]:
+    m = EMAIL_RE.search(text or "")
+    return m.group(0) if m else None
+
+def harvest_phone(text: str) -> Optional[str]:
+    m = PHONE_RE.search(text or "")
+    return m.group(0).strip() if m else None
+
+def harvest_name(text: str) -> Optional[str]:
+    t = (text or "").strip()
+    m = NAME_RE.search(t)
+    if not m:
+        return None
+    # group(2) is the actual name in your pattern (group 1 is "i'm / i am / this is")
+    raw = m.group(2).strip()
+    # neat title-case that preserves apostrophes/dashes reasonably
+    parts = re.split(r"\s+", raw)
+    return " ".join(p[:1].upper() + p[1:].lower() for p in parts)
+
 # in-memory flow per session
 _SESS: Dict[str, Dict] = {}
 

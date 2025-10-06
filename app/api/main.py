@@ -32,8 +32,10 @@ from app.core.config import (
 from app.retrieval.retriever import search, get_facts
 from app.generation.generator import generate_answer
 from app.lead.capture import in_progress as lead_in_progress, start as lead_start, take_turn as lead_turn
+from app.lead.capture import harvest_email, harvest_phone, harvest_name
 import re
 from app.retrieval.leads import save_lead
+from app.core.session_mem import get_state, set_state
 
 _EMAIL_RX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _PHONE_RX = re.compile(r"\+?\d[\d\s().-]{6,}")
@@ -103,26 +105,28 @@ def api_chat(req: ChatRequest) -> ChatResponse:
       - lead        → multi-turn capture flow (name → contact → time → notes)
       - other/services → generator with RAG
     """
+    # 1) normalize & guard
     q = (req.question or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="empty_question")
 
-    # ADD ① — continue any in-progress lead flow *before* intent detection
+    # 2) continue any in-progress lead flow *before* intent detection
     if lead_in_progress(req.session_id):
         return ChatResponse(answer=lead_turn(req.session_id, q))
 
+    # 3) detect intent
     intent, smalltalk = detect_intent(q)
 
-    # 1) Smalltalk short-circuit
+    # 4) smalltalk short-circuit
     if intent == "smalltalk" and ENABLE_SMALLTALK and smalltalk:
         return ChatResponse(answer=smalltalk)
 
-    # ADD ② — start a new lead-capture flow
+    # 5) start a new lead-capture flow on explicit ask
     if intent == "lead":
         first = lead_start(req.session_id, kind="callback")
         return ChatResponse(answer=first)
 
-    # 2) Facts-first for contact/pricing
+    # 6) facts-first for contact/pricing
     if intent in ("contact", "pricing") and ENABLE_FACTS:
         names = (
             ["contact_email", "contact_phone", "contact_url", "office_address"]
@@ -135,75 +139,70 @@ def api_chat(req: ChatRequest) -> ChatResponse:
                 # your existing focused contact logic...
                 intent, focus = detect_intent(q)
 
-                if focus == "email":
-                    names = ["contact_email"]
-                elif focus == "phone":
-                    names = ["contact_phone"]
-                elif focus == "address":
-                    names = ["office_address"]
-                elif focus == "url":
-                    names = ["contact_url"]
-                else:
-                    names = ["contact_email", "contact_phone", "contact_url", "office_address"]
+                # --- Lead capture: harvest + short-term memory + persist ---
+                state = get_state(req.session_id)
 
-                facts = get_facts(names)
-                if facts:
-                    email = facts.get("contact_email")
-                    phone = facts.get("contact_phone")
-                    url   = facts.get("contact_url")
-                    addr  = facts.get("office_address")
+                # 1) harvest from current message (fall back to what we remembered)
+                name  = harvest_name(q)   or state.get("name")
+                phone = harvest_phone(q)  or state.get("phone")
+                email = harvest_email(q)  or state.get("email")
 
-                    # Try to harvest contact info the user typed in this message
-                    found_email = None
-                    m_email = _EMAIL_RX.search(q)
-                    if m_email:
-                        found_email = m_email.group(0)
+                # keep short-term memory updated for this session
+                set_state(req.session_id, name=name, phone=phone, email=email)
 
-                    found_phone = None
-                    m_phone = _PHONE_RX.search(q)
-                    if m_phone:
-                        found_phone = m_phone.group(0).strip()
-
-                    # If they provided any useful contact info, persist the lead
-                    if found_email or found_phone:
-                        try:
-                            save_lead(
-                                req.session_id,
-                                name=None,            # fill later if/when you collect it
-                                phone=found_phone,
-                                email=found_email,
-                                preferred_time=None,  # fill later if/when you parse it
-                                notes=q,              # keep the raw user message for context
-                                source="chat",
-                            )
-                        except Exception:
-                            # fail-quietly; we don't want a DB hiccup to break the reply
-                            pass
-
-                    if focus == "email" and email:
-                        return ChatResponse(answer=f"You can email us at {email}.")
-                    if focus == "phone" and phone:
-                        return ChatResponse(answer=f"You can call us on {phone}.")
-                    if focus == "address" and addr:
-                        return ChatResponse(answer=f"We’re based at {addr}.")
-                    if focus == "url" and url:
-                        return ChatResponse(answer=f"Our website is {url}.")
+                # 2) persist a lead as soon as we have *any* contact point
+                if phone or email:
+                    try:
+                        save_lead(
+                            session_id=req.session_id,
+                            name=name,
+                            phone=phone,
+                            email=email,
+                            preferred_time=state.get("preferred_time"),
+                            notes=q,
+                            source="chat",
+                        )
+                    except Exception as e:
+                        print("lead insert failed:", e)
+                
+                # Pure info-seeking fallback: user asked *how to contact* but didn't give their details
+                if not phone and not email and focus == "generic":
+                    email_f = facts.get("contact_email")
+                    phone_f = facts.get("contact_phone")
+                    url_f   = facts.get("contact_url")
+                    addr_f  = facts.get("office_address")
 
                     parts = []
-                    if email: parts.append(f"email ({email})")
-                    if phone: parts.append("phone")
-                    if url:   parts.append(f"our website: {url}")
-                    if addr:  parts.append(f"our office: {addr}")
+                    if email_f: parts.append(f"email {email_f}")
+                    if phone_f: parts.append(f"phone {phone_f}")
+                    if url_f:   parts.append(f"website {url_f}")
+                    if addr_f:  parts.append(f"office {addr_f}")
 
                     if parts:
-                        if len(parts) == 1:
-                            return ChatResponse(answer=f"You can contact us via {parts[0]}.")
-                        lead_txt, last = ", ".join(parts[:-1]), parts[-1]
-                        return ChatResponse(answer=f"You can contact us via {lead_txt}, or {last}.")
+                        lead_txt, last = (", ".join(parts[:-1]), parts[-1]) if len(parts) > 1 else ("", parts[0])
+                        msg = f"You can contact us via {lead_txt + (', ' if lead_txt else '')}{last}."
+                        return ChatResponse(
+                            answer=msg + " If you'd like, I can also arrange a callback—what's the best phone number for you?"
+                        )
 
-                    return ChatResponse(answer="You can reach us through our website or messaging channels.")
+                # 3) determine next, natural question (no LLM here)
+                if not name:
+                    return ChatResponse(answer="Got it. May I take your name?")
+                if not phone and not email:
+                    return ChatResponse(answer="Happy to arrange a callback. What’s the best phone number for you?")
+                if not phone and email:
+                    return ChatResponse(answer="Thanks for the email. Do you also have a phone number for the callback?")
 
+                # 4) we have enough to proceed; confirm succinctly
+                if phone and email:
+                    return ChatResponse(answer=f"Thanks {name}. I’ve noted your phone and email. We’ll be in touch shortly.")
+                if phone:
+                    return ChatResponse(answer=f"Thanks {name}. I’ve got your phone number. We’ll call you shortly.")
+                # fallback: only email (no phone)
+                return ChatResponse(answer=f"Thanks {name}. I’ve noted your email. If you’d like a call, feel free to share a phone number.")
+            
             else:
+                # pricing branch
                 bullets_val = facts.get("pricing_bullet")
                 overview    = facts.get("pricing_overview")
                 top = [bullets_val] if bullets_val else []
@@ -212,7 +211,7 @@ def api_chat(req: ChatRequest) -> ChatResponse:
                     prefix = f"{overview} — " if overview else ""
                     return ChatResponse(answer=f"{prefix}{joined}")
 
-    # 3) Default: generate with RAG (never deflect)
+    # 7) default: generate with RAG (never deflect)
     result = generate_answer(
         question=q,
         k=req.k or RETRIEVAL_TOP_K,
