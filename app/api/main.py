@@ -4,13 +4,10 @@ app/api/main.py
 FastAPI entrypoint for Corah.
 - /api/health  : liveness
 - /api/search  : retrieval-only probe
-- /api/chat    : routed chat (smalltalk / facts-first / RAG answer)
-
-This module wires the lightweight router and the generation pipeline.
+- /api/chat    : LLM-first sandwich (context -> retrieval -> LLM)
 """
 
 from __future__ import annotations
-
 from typing import List
 
 from fastapi import FastAPI, HTTPException, Query
@@ -23,23 +20,18 @@ from app.api.schemas import (
     SearchHit,
     SearchResponse,
 )
-from app.api.intents import detect_intent
-from app.core.config import (
-    ENABLE_SMALLTALK,
-    ENABLE_FACTS,
-    RETRIEVAL_TOP_K,
-)
+from app.core.config import RETRIEVAL_TOP_K
 from app.retrieval.retriever import search, get_facts
 from app.generation.generator import generate_answer
-from app.lead.capture import in_progress as lead_in_progress, start as lead_start, take_turn as lead_turn
-from app.lead.capture import harvest_email, harvest_phone, harvest_name
-import re
-from app.retrieval.leads import save_lead
+from app.lead.capture import (
+    in_progress as lead_in_progress,
+    start as lead_start,
+    take_turn as lead_turn,
+    harvest_email,
+    harvest_phone,
+    harvest_name,
+)
 from app.core.session_mem import get_state, set_state, append_turn, recent_turns
-from app.lead.capture import in_progress as lead_in_progress, start as lead_start, take_turn as lead_turn
-
-_EMAIL_RX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-_PHONE_RX = re.compile(r"\+?\d[\d\s().-]{6,}")
 
 
 app = FastAPI(
@@ -50,10 +42,10 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
-# CORS (relaxed by default; tighten for prod domain(s))
+# CORS (relax for dev; restrict in prod)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # replace with your site origin in prod
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -94,164 +86,111 @@ def api_search(q: str = Query(..., min_length=1), k: int = Query(RETRIEVAL_TOP_K
 
 
 # ---------------------------
-# Chat
+# Chat (LLM-first sandwich)
 # ---------------------------
 
 @app.post("/api/chat", response_model=ChatResponse)
 def api_chat(req: ChatRequest) -> ChatResponse:
     """
-    Routed chat:
-      - smalltalk → immediate friendly reply (no RAG)
-      - contact/pricing → facts-first (if enabled), fallback to generator
-      - lead        → multi-turn capture flow (name → contact → time → notes)
-      - other/services → generator with RAG
+    LLM-first sandwich on every turn:
+      user -> LLM (sees state + facts + last msg) -> retrieval -> LLM final
     """
-    # 1) normalize & guard
     q = (req.question or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="empty_question")
 
-    append_turn(req.session_id, "user", q)
+    session_id = req.session_id
 
-    if lead_in_progress(req.session_id):
-        reply = lead_turn(req.session_id, q)
-        append_turn(req.session_id, "assistant", reply)
-        return ChatResponse(answer=reply)
+    # record the user turn so heuristics/LLM see the latest message
+    append_turn(session_id, "user", q)
 
+    # ----- 1) Short-term memory (harvest & store) -----
+    state = get_state(session_id)  # { name, phone, email, preferred_time, ... }
+    name  = harvest_name(q)   or state.get("name")
+    phone = harvest_phone(q)  or state.get("phone")
+    email = harvest_email(q)  or state.get("email")
+    set_state(session_id, name=name, phone=phone, email=email)
 
-    # 2) continue any in-progress lead flow *before* intent detection
-    if lead_in_progress(req.session_id):
-        return ChatResponse(answer=lead_turn(req.session_id, q))
+    # ----- 2) Lead flow hinting for the LLM -----
+    lead_hint = None
+    if lead_in_progress(session_id):
+        next_prompt = lead_turn(session_id, q)  # advances stage; returns the next question to ask
+        lead_hint = f"Lead flow in progress. Ask this next, in a warm, concise way: {next_prompt}"
+    else:
+        trigger = any(x in q.lower() for x in [
+            "start", "begin", "book a call", "call me", "can you call", "arrange a call",
+            "i want to start", "how do i start", "i'm ready", "let's go"
+        ]) or bool(phone or email)
+        if trigger:
+            first = lead_start(session_id, kind="callback")  # sets stage="name"
+            lead_hint = f"Start a lead capture (callback). Ask this first: {first}"
 
-    # 3) detect intent
-    intent, smalltalk = detect_intent(q)
+    # ----- 3) Facts for the LLM (contact/pricing) -----
+    fact_names = ["contact_email", "contact_phone", "contact_url", "office_address",
+                  "pricing_bullet", "pricing_overview"]
+    facts = get_facts(fact_names) or {}
+    contact_lines = []
+    if facts.get("contact_email"):  contact_lines.append(f"Email: {facts['contact_email']}")
+    if facts.get("contact_phone"):  contact_lines.append(f"Phone: {facts['contact_phone']}")
+    if facts.get("contact_url"):    contact_lines.append(f"Website: {facts['contact_url']}")
+    if facts.get("office_address"): contact_lines.append(f"Office: {facts['office_address']}")
+    contact_context = "\n".join(contact_lines) if contact_lines else "None available"
 
-    # 4) smalltalk short-circuit
-    if intent == "smalltalk" and ENABLE_SMALLTALK and smalltalk:
-        return ChatResponse(answer=smalltalk)
+    pricing_context = ""
+    if facts.get("pricing_overview"):
+        pricing_context += f"Overview: {facts['pricing_overview']}\n"
+    if facts.get("pricing_bullet"):
+        pricing_context += f"Key point: {facts['pricing_bullet']}\n"
 
-    # 5) start a new lead-capture flow on explicit ask
-    if intent == "lead":
-        first = lead_start(req.session_id, kind="callback")
-        return ChatResponse(answer=first)
+    # ----- 4) Compose augmented question for the generator -----
+    lead_state_line = f"name={name or '-'}, phone={phone or '-'}, email={email or '-'}, preferred_time={state.get('preferred_time','-')}"
+    lead_hint_text = f"\nLead hint: {lead_hint}" if lead_hint else ""
 
-    # 6) facts-first for contact/pricing
-    if intent in ("contact", "pricing") and ENABLE_FACTS:
-        names = (
-            ["contact_email", "contact_phone", "contact_url", "office_address"]
-            if intent == "contact"
-            else ["pricing_bullet", "pricing_overview"]
-        )
-        facts = get_facts(names)
-        if facts:
-            if intent == "contact":
-                # your existing focused contact logic...
-                intent, focus = detect_intent(q)
+    augmented_q = (
+        f"{q}\n\n"
+        f"[Context]\n"
+        f"- Company contact:\n{contact_context or 'None'}\n"
+        f"- Pricing:\n{pricing_context or 'None'}\n"
+        f"- Lead state: {lead_state_line}\n"
+        f"{lead_hint_text}\n"
+        f"[End Context]\n"
+    )
 
-                # --- Lead capture: harvest + short-term memory + persist ---
-                state = get_state(req.session_id)
-
-                # 1) harvest from current message (fall back to what we remembered)
-                name  = harvest_name(q)   or state.get("name")
-                phone = harvest_phone(q)  or state.get("phone")
-                email = harvest_email(q)  or state.get("email")
-
-                # keep short-term memory updated for this session
-                set_state(req.session_id, name=name, phone=phone, email=email)
-
-                # 2) persist a lead as soon as we have *any* contact point
-                if phone or email:
-                    try:
-                        save_lead(
-                            session_id=req.session_id,
-                            name=name,
-                            phone=phone,
-                            email=email,
-                            preferred_time=state.get("preferred_time"),
-                            notes=q,
-                            source="chat",
-                        )
-                    except Exception as e:
-                        print("lead insert failed:", e)
-                
-                # Pure info-seeking fallback: user asked *how to contact* but didn't give their details
-                if not phone and not email and focus == "generic":
-                    email_f = facts.get("contact_email")
-                    phone_f = facts.get("contact_phone")
-                    url_f   = facts.get("contact_url")
-                    addr_f  = facts.get("office_address")
-
-                    parts = []
-                    if email_f: parts.append(f"email {email_f}")
-                    if phone_f: parts.append(f"phone {phone_f}")
-                    if url_f:   parts.append(f"website {url_f}")
-                    if addr_f:  parts.append(f"office {addr_f}")
-
-                    if parts:
-                        lead_txt, last = (", ".join(parts[:-1]), parts[-1]) if len(parts) > 1 else ("", parts[0])
-                        msg = f"You can contact us via {lead_txt + (', ' if lead_txt else '')}{last}."
-                        return ChatResponse(
-                            answer=msg + " If you'd like, I can also arrange a callback—what's the best phone number for you?"
-                        )
-
-                # 3) determine next, natural question (no LLM here)
-                if not name:
-                    return ChatResponse(answer="Got it. May I take your name?")
-                if not phone and not email:
-                    return ChatResponse(answer="Happy to arrange a callback. What’s the best phone number for you?")
-                if not phone and email:
-                    return ChatResponse(answer="Thanks for the email. Do you also have a phone number for the callback?")
-
-                # 4) we have enough to proceed; confirm succinctly
-                if phone and email:
-                    return ChatResponse(answer=f"Thanks {name}. I’ve noted your phone and email. We’ll be in touch shortly.")
-                if phone:
-                    return ChatResponse(answer=f"Thanks {name}. I’ve got your phone number. We’ll call you shortly.")
-                # fallback: only email (no phone)
-                return ChatResponse(answer=f"Thanks {name}. I’ve noted your email. If you’d like a call, feel free to share a phone number.")
-            
-            else:
-                # pricing branch
-                bullets_val = facts.get("pricing_bullet")
-                overview    = facts.get("pricing_overview")
-                top = [bullets_val] if bullets_val else []
-                joined = " • ".join(top) if top else ""
-                if overview or joined:
-                    prefix = f"{overview} — " if overview else ""
-                    return ChatResponse(answer=f"{prefix}{joined}")
-
-    # 7) default: generate with RAG (never deflect)
-    # 3) Default: generate with RAG (never deflect)
+    # ----- 5) LLM sandwich (retrieve -> LLM) -----
     result = generate_answer(
-        question=q,
+        question=augmented_q,
         k=req.k or RETRIEVAL_TOP_K,
         max_context_chars=req.max_context or 3000,
         debug=req.debug,
         show_citations=req.citations,
     )
-    # --- begin addition: behavior-triggered lead prompt ---
-    answer = result.get("answer", "").strip()
-    cls = classify_lead_intent(recent_turns(req.session_id, n=4))
 
-    trigger = (
+    # ----- 6) Behavior-triggered lead prompt (post-LLM) -----
+    answer = result.get("answer", "").strip()
+    cls = classify_lead_intent(recent_turns(session_id, n=4))
+
+    trigger2 = (
         cls.get("explicit_cta")
         or cls.get("contact_given")
         or (cls.get("interest") in ("buying", "explicit_cta") and float(cls.get("confidence", 0)) >= 0.65)
     )
-
-    if trigger and not lead_in_progress(req.session_id):
-        lead_msg = lead_start(req.session_id)  # "Great — I can arrange that. What’s your name?"
+    if trigger2 and not lead_in_progress(session_id):
+        lead_msg = lead_start(session_id)  # “Great — I can arrange that. What’s your name?”
         answer = (answer + "\n\n" + lead_msg).strip()
 
-    append_turn(req.session_id, "assistant", answer)
+    append_turn(session_id, "assistant", answer)
     return ChatResponse(answer=answer, citations=result.get("citations"), debug=result.get("debug"))
 
-def classify_lead_intent(turns: list[dict]) -> dict:
+
+# ---------------------------
+# Tiny heuristic classifier (no LLM yet)
+# ---------------------------
+
+def classify_lead_intent(turns: List[dict]) -> dict:
     """
-    Ultra-light heuristic classifier (no LLM yet).
     Looks at the last few turns and flags 'explicit_cta', 'contact_given', etc.
     """
-    text = " ".join(t.get("content","") for t in turns[-4:])
+    text = " ".join(t.get("content", "") for t in turns[-4:])
     t = text.lower()
 
     explicit_cta_terms = [
