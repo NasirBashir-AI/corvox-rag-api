@@ -35,7 +35,8 @@ from app.lead.capture import in_progress as lead_in_progress, start as lead_star
 from app.lead.capture import harvest_email, harvest_phone, harvest_name
 import re
 from app.retrieval.leads import save_lead
-from app.core.session_mem import get_state, set_state
+from app.core.session_mem import get_state, set_state, append_turn, recent_turns
+from app.lead.capture import in_progress as lead_in_progress, start as lead_start, take_turn as lead_turn
 
 _EMAIL_RX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _PHONE_RX = re.compile(r"\+?\d[\d\s().-]{6,}")
@@ -109,6 +110,14 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     q = (req.question or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="empty_question")
+
+    append_turn(req.session_id, "user", q)
+
+    if lead_in_progress(req.session_id):
+        reply = lead_turn(req.session_id, q)
+        append_turn(req.session_id, "assistant", reply)
+        return ChatResponse(answer=reply)
+
 
     # 2) continue any in-progress lead flow *before* intent detection
     if lead_in_progress(req.session_id):
@@ -212,6 +221,7 @@ def api_chat(req: ChatRequest) -> ChatResponse:
                     return ChatResponse(answer=f"{prefix}{joined}")
 
     # 7) default: generate with RAG (never deflect)
+    # 3) Default: generate with RAG (never deflect)
     result = generate_answer(
         question=q,
         k=req.k or RETRIEVAL_TOP_K,
@@ -219,4 +229,49 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         debug=req.debug,
         show_citations=req.citations,
     )
-    return ChatResponse(**result)  # type: ignore[arg-type]
+    # --- begin addition: behavior-triggered lead prompt ---
+    answer = result.get("answer", "").strip()
+    cls = classify_lead_intent(recent_turns(req.session_id, n=4))
+
+    trigger = (
+        cls.get("explicit_cta")
+        or cls.get("contact_given")
+        or (cls.get("interest") in ("buying", "explicit_cta") and float(cls.get("confidence", 0)) >= 0.65)
+    )
+
+    if trigger and not lead_in_progress(req.session_id):
+        lead_msg = lead_start(req.session_id)  # "Great — I can arrange that. What’s your name?"
+        answer = (answer + "\n\n" + lead_msg).strip()
+
+    append_turn(req.session_id, "assistant", answer)
+    return ChatResponse(answer=answer, citations=result.get("citations"), debug=result.get("debug"))
+
+def classify_lead_intent(turns: list[dict]) -> dict:
+    """
+    Ultra-light heuristic classifier (no LLM yet).
+    Looks at the last few turns and flags 'explicit_cta', 'contact_given', etc.
+    """
+    text = " ".join(t.get("content","") for t in turns[-4:])
+    t = text.lower()
+
+    explicit_cta_terms = [
+        "book a call", "arrange a call", "call me", "can you call", "call back",
+        "how do i start", "let's start", "get started", "sign me up", "move forward",
+        "can we talk", "schedule a call", "set up a call"
+    ]
+    buying_terms = [
+        "i like this", "sounds good", "i’m interested", "i am interested",
+        "this is good", "want this", "we want this", "we need this"
+    ]
+    contact_given = ("@" in t) or any(k in t for k in ["phone", "call me on", "+", "whatsapp"])
+
+    explicit_cta = any(kw in t for kw in explicit_cta_terms)
+    buying = any(kw in t for kw in buying_terms)
+
+    if explicit_cta:
+        return {"interest": "explicit_cta", "explicit_cta": True, "contact_given": contact_given, "confidence": 0.9}
+    if contact_given:
+        return {"interest": "buying", "explicit_cta": False, "contact_given": True, "confidence": 0.8}
+    if buying:
+        return {"interest": "buying", "explicit_cta": False, "contact_given": False, "confidence": 0.7}
+    return {"interest": "curious", "explicit_cta": False, "contact_given": False, "confidence": 0.4}
