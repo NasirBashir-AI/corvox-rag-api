@@ -69,4 +69,5 @@ class Citation(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     citations: Optional[List[Citation]] = None
-    debug: Optional[Dict[str, Any]] = None
+    debug: Optional[dict] = None
+    end_session: bool = False   # NEW: UI can close on true

@@ -1,19 +1,13 @@
-# app/lead/capture.py
 from __future__ import annotations
 
 import re
-import uuid
-from typing import Dict, Optional
+from datetime import datetime, timezone
+from typing import Optional
 
-from app.core.config import DB_URL
-from app.core.utils import pg_cursor
 from app.core.session_mem import get_state, set_state
+from app.retrieval.leads import mark_stage, mark_done
 
-
-# -----------------------------
-# Simple extractors (harvesters)
-# -----------------------------
-
+# ---------- Lightweight extractors ----------
 EMAIL_RE  = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 PHONE_RE  = re.compile(r"(\+?\d[\d\s().-]{7,}\d)")
 NAME_RE   = re.compile(r"\b(i'?m|i am|this is)\s+([A-Za-z][A-Za-z\-\' ]{1,40})", re.I)
@@ -29,198 +23,118 @@ def harvest_phone(text: str) -> Optional[str]:
 def harvest_name(text: str) -> Optional[str]:
     t = (text or "").strip()
     m = NAME_RE.search(t)
-    if not m:
+    if m:
+        raw = m.group(2).strip()
+    else:
+        # Accept short single-line names like “Sam Patel”
+        words = t.split()
+        raw = t if 1 <= len(words) <= 5 else ""
+    if not raw:
         return None
-    # group(2) is the actual name (group 1 is "i'm / i am / this is")
-    raw = m.group(2).strip()
     parts = re.split(r"\s+", raw)
     return " ".join(p[:1].upper() + p[1:].lower() for p in parts)
 
-
-# -----------------------------
-# Lead flow (short-term memory)
-# -----------------------------
-# We keep the flow state per session inside session_mem, not a module global,
-# so multiple workers/processes see the same in-memory state.
-
-_LEAD_KEY = "lead_flow"   # entire dict stored under this key in session state
-
-
-def _get_lead(session_id: str) -> Optional[Dict]:
-    st = get_state(session_id) or {}
-    return st.get(_LEAD_KEY)
-
-
-def _set_lead(session_id: str, lead: Dict) -> None:
-    st = get_state(session_id) or {}
-    st[_LEAD_KEY] = lead
-    set_state(session_id, **st)
-
-
-def _clear_lead(session_id: str) -> None:
-    st = get_state(session_id) or {}
-    if _LEAD_KEY in st:
-        st.pop(_LEAD_KEY, None)
-        set_state(session_id, **st)
-
+# ---------- Helpers ----------
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 def in_progress(session_id: str) -> bool:
-    """Is a lead-capture conversation currently in progress for this session?"""
-    return _get_lead(session_id) is not None
-
+    st = get_state(session_id)
+    stage = (st or {}).get("lead_stage")
+    return bool(stage and stage != "done")
 
 def start(session_id: str, kind: str = "callback") -> str:
-    """Start a new lead flow: name -> contact -> time -> notes -> done."""
-    lead = {
-        "id": "LEAD-" + uuid.uuid4().hex[:8].upper(),
-        "kind": kind,                         # 'callback' / 'demo' / 'consult'
-        "stage": "name",                      # name -> contact -> time -> notes
-        "data": {},                           # name / phone / email / preferred_time / notes
-    }
-    _set_lead(session_id, lead)
+    """
+    Begin a lead capture flow. Stage -> 'name'
+    Also persists an initial row with stage='name'.
+    Micro-guard: if already done, don’t restart.
+    """
+    st = get_state(session_id) or {}
+    if st.get("lead_stage") == "done":
+        # Gentle reminder instead of restarting
+        return "We’ve got your details on file already. If you’d like to update anything or need something else, just let me know."
+    set_state(session_id, lead_stage="name", lead_kind=kind, lead_started_at=_now_iso())
+    mark_stage(session_id, stage="name", source="chat")
     return "Great — I can arrange that. What’s your name?"
-
-
-def _extract_name(text: str) -> Optional[str]:
-    m = NAME_RE.search(text or "")
-    if m:
-        return m.group(2).strip()
-    # fallback: a short single-line name without the “I'm …” pattern
-    t = (text or "").strip()
-    if 1 <= len(t.split()) <= 5 and all(ch.isalpha() or ch in " -'" for ch in t):
-        return t
-    return None
-
-
-def _extract_email(text: str) -> Optional[str]:
-    m = EMAIL_RE.search(text or "")
-    return m.group(0) if m else None
-
-
-def _extract_phone(text: str) -> Optional[str]:
-    m = PHONE_RE.search(text or "")
-    return m.group(0).strip() if m else None
-
 
 def take_turn(session_id: str, text: str) -> str:
     """
-    Advance the multi-turn capture flow using the current message text.
+    Advance the state machine one step and persist at each transition.
+    Returns the next question/confirmation to show the user.
     Stages: name -> contact -> time -> notes -> done
     """
-    lead = _get_lead(session_id)
-    if not lead:
-        # If the flow vanished, restart gently.
-        return start(session_id)
+    st = get_state(session_id) or {}
+    stage = st.get("lead_stage") or "name"
 
-    stage = lead["stage"]
-    data  = lead["data"]
+    # Micro-guard: normalize any unexpected stage to "name"
+    if stage not in {"name", "contact", "time", "notes", "done"}:
+        stage = "name"
+        set_state(session_id, lead_stage="name")
+        mark_stage(session_id, stage="name")
 
-    # 1) Name
+    # --- NAME ---
     if stage == "name":
-        n = _extract_name(text)
+        n = harvest_name(text)
         if not n:
             return "Could you share your name (e.g., “I’m Sam Patel”)?"
-        data["name"] = n
-        lead["stage"] = "contact"
-        _set_lead(session_id, lead)
-        # Ask for phone first for callbacks; email is accepted too.
-        return f"Thanks, {n}. What’s the best **phone number** for you? (You can share an email instead if you prefer.)"
+        set_state(session_id, name=n, lead_stage="contact")
+        mark_stage(session_id, stage="contact", name=n, source="chat")
+        return f"Thanks, {n}. What’s the best phone number or email to reach you?"
 
-    # 2) Contact
+    # --- CONTACT ---
     if stage == "contact":
-        em, ph = _extract_email(text), _extract_phone(text)
+        em = harvest_email(text)
+        ph = harvest_phone(text)
         if em:
-            data["email"] = em
+            set_state(session_id, email=em)
         if ph:
-            data["phone"] = ph
-        if not (em or ph):
+            set_state(session_id, phone=ph)
+
+        if not (em or ph or st.get("email") or st.get("phone")):
             return "I didn’t catch a valid phone or email. Please share one of them."
-        lead["stage"] = "time"
-        _set_lead(session_id, lead)
+
+        set_state(session_id, lead_stage="time")
+        mark_stage(
+            session_id,
+            stage="time",
+            email=em or st.get("email"),
+            phone=ph or st.get("phone"),
+        )
         return "When is a good time (and timezone) for us to contact you?"
 
-    # 3) Time preference
+    # --- TIME ---
     if stage == "time":
         pref = (text or "").strip()
-        if pref:
-            data["preferred_time"] = pref
-        lead["stage"] = "notes"
-        _set_lead(session_id, lead)
+        if not pref:
+            return "What time works best (and your timezone)?"
+        set_state(session_id, preferred_time=pref, lead_stage="notes")
+        mark_stage(session_id, stage="notes", preferred_time=pref)
         return "Got it. Any extra context about your needs? (optional)"
 
-    # 4) Notes (final)
+    # --- NOTES ---
     if stage == "notes":
-        note = (text or "").strip()
-        if note:
-            data["notes"] = note
+        notes = (text or "").strip()
+        if notes:
+            set_state(session_id, notes=notes)
 
-        # Persist a structured lead row
-        try:
-            save_lead(
-                session_id=session_id,
-                name=data.get("name"),
-                phone=data.get("phone"),
-                email=data.get("email"),
-                preferred_time=data.get("preferred_time"),
-                notes=data.get("notes"),
-                source="chat",
-            )
-        finally:
-            lead_id = lead["id"]
-            _clear_lead(session_id)
-
-        return f"All set! I’ve logged your request ({lead_id}). We’ll contact you shortly. Anything else I can help with?"
-
-    # Fallback
-    return "Let me just confirm—could you share your name?"
-
-
-# -----------------------------
-# DB persistence (short-term path)
-# -----------------------------
-
-def save_lead(
-    session_id: str,
-    name: Optional[str] = None,
-    phone: Optional[str] = None,
-    email: Optional[str] = None,
-    preferred_time: Optional[str] = None,
-    notes: Optional[str] = None,
-    source: str = "chat",
-) -> None:
-    """
-    Insert a structured lead row. This uses a lightweight DDL guard so it works
-    even if the table hasn't been created yet.
-    """
-    sql = """
-    CREATE TABLE IF NOT EXISTS corah_store.leads(
-        id BIGSERIAL PRIMARY KEY,
-        session_id     TEXT,
-        name           TEXT,
-        phone          TEXT,
-        email          TEXT,
-        preferred_time TEXT,
-        notes          TEXT,
-        source         TEXT DEFAULT 'chat',
-        created_at     TIMESTAMPTZ DEFAULT now(),
-        updated_at     TIMESTAMPTZ DEFAULT now()
-    );
-
-    INSERT INTO corah_store.leads
-        (session_id, name, phone, email, preferred_time, notes, source)
-    VALUES
-        (%s, %s, %s, %s, %s, %s, %s);
-    """
-    with pg_cursor(DB_URL) as cur:
-        cur.execute(
-            sql,
-            (
-                session_id,
-                name,
-                phone,
-                email,
-                preferred_time,
-                notes,
-                source,
-            ),
+        st = get_state(session_id) or {}
+        # Persist final + mark done
+        mark_done(
+            session_id,
+            name=st.get("name"),
+            phone=st.get("phone"),
+            email=st.get("email"),
+            preferred_time=st.get("preferred_time"),
+            notes=st.get("notes") or notes or None,
+            done_at=_now_iso(),
         )
+        set_state(session_id, lead_stage="done", lead_done_at=_now_iso())
+        # Polite sign-off. The API can also send end_session=True (see main.py)
+        return (
+            "All set — I’ve logged your request and we’ll be in touch shortly. "
+            "I’ll close this chat now. If you have more questions later, just start a new session. Take care!"
+        )
+
+    # --- DONE (or unknown) ---
+    set_state(session_id, lead_stage="done")
+    return "We’ve got your details noted. Anything else I can help with?"

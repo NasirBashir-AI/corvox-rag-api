@@ -9,6 +9,7 @@ FastAPI entrypoint for Corah.
 
 from __future__ import annotations
 from typing import List
+from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,7 +52,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # ---------------------------
 # Health
 # ---------------------------
@@ -59,7 +59,6 @@ app.add_middleware(
 @app.get("/api/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(ok=True)
-
 
 # ---------------------------
 # Retrieval probe
@@ -84,10 +83,11 @@ def api_search(q: str = Query(..., min_length=1), k: int = Query(RETRIEVAL_TOP_K
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"search_failed: {type(e).__name__}: {e}")
 
-
 # ---------------------------
 # Chat (LLM-first sandwich)
 # ---------------------------
+
+_COOLDOWN_SECONDS = 60  # nudger cooldown
 
 @app.post("/api/chat", response_model=ChatResponse)
 def api_chat(req: ChatRequest) -> ChatResponse:
@@ -100,30 +100,55 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=400, detail="empty_question")
 
     session_id = req.session_id
+    now = datetime.now(timezone.utc)
 
     # record the user turn so heuristics/LLM see the latest message
     append_turn(session_id, "user", q)
 
     # ----- 1) Short-term memory (harvest & store) -----
-    state = get_state(session_id)  # { name, phone, email, preferred_time, ... }
+    state = get_state(session_id)  # { name, phone, email, preferred_time, lead_started_at, lead_done_at, lead_nudge_at, ... }
+
     name  = harvest_name(q)   or state.get("name")
     phone = harvest_phone(q)  or state.get("phone")
     email = harvest_email(q)  or state.get("email")
     set_state(session_id, name=name, phone=phone, email=email)
 
-    # ----- 2) Lead flow hinting for the LLM -----
+    # Persistent guard flags
+    started_at_iso = state.get("lead_started_at")
+    done_at_iso    = state.get("lead_done_at")
+    already_started = bool(started_at_iso)
+    already_done    = bool(done_at_iso)
+
+    # Cooldown guard for nudger
+    nudge_at_iso = state.get("lead_nudge_at")
+    recent_nudge = False
+    if nudge_at_iso:
+        try:
+            last_dt = datetime.fromisoformat(nudge_at_iso)
+            recent_nudge = (now - last_dt) < timedelta(seconds=_COOLDOWN_SECONDS)
+        except Exception:
+            recent_nudge = False
+
+    # ----- 2) Lead flow hinting for the LLM (with cooldown + guard flags) -----
     lead_hint = None
     if lead_in_progress(session_id):
-        next_prompt = lead_turn(session_id, q)  # advances stage; returns the next question to ask
+        # advances stage; returns the next question to ask
+        next_prompt = lead_turn(session_id, q)
         lead_hint = f"Lead flow in progress. Ask this next, in a warm, concise way: {next_prompt}"
     else:
+        # simple trigger (heuristic); LLM classifier can replace this later
         trigger = any(x in q.lower() for x in [
             "start", "begin", "book a call", "call me", "can you call", "arrange a call",
             "i want to start", "how do i start", "i'm ready", "let's go"
         ]) or bool(phone or email)
-        if trigger:
-            first = lead_start(session_id, kind="callback")  # sets stage="name"
+
+        # GUARD: do not (re)start if this session has already started a lead before,
+        # or if it's already marked done, or if we nudged very recently.
+        if trigger and (not already_started) and (not already_done) and (not recent_nudge):
+            first = lead_start(session_id, kind="callback")  # sets stage="name" and persists
             lead_hint = f"Start a lead capture (callback). Ask this first: {first}"
+            # set persistent "started" and cooldown timestamps
+            set_state(session_id, lead_started_at=now.isoformat(), lead_nudge_at=now.isoformat())
 
     # ----- 3) Facts for the LLM (contact/pricing) -----
     fact_names = ["contact_email", "contact_phone", "contact_url", "office_address",
@@ -165,7 +190,7 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         show_citations=req.citations,
     )
 
-    # ----- 6) Behavior-triggered lead prompt (post-LLM) -----
+    # ----- 6) Behavior-triggered lead prompt (post-LLM) with same guards -----
     answer = result.get("answer", "").strip()
     cls = classify_lead_intent(recent_turns(session_id, n=4))
 
@@ -174,13 +199,26 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         or cls.get("contact_given")
         or (cls.get("interest") in ("buying", "explicit_cta") and float(cls.get("confidence", 0)) >= 0.65)
     )
-    if trigger2 and not lead_in_progress(session_id):
+
+    # GUARD: same conditions apply here; do not re-start if started/done, or if we nudged very recently.
+    if trigger2 and (not lead_in_progress(session_id)) and (not already_started) and (not already_done) and (not recent_nudge):
         lead_msg = lead_start(session_id)  # “Great — I can arrange that. What’s your name?”
         answer = (answer + "\n\n" + lead_msg).strip()
+        set_state(session_id, lead_started_at=now.isoformat(), lead_nudge_at=now.isoformat())
 
     append_turn(session_id, "assistant", answer)
-    return ChatResponse(answer=answer, citations=result.get("citations"), debug=result.get("debug"))
+    # If the lead just completed, signal the UI to end the chat
+    end_session = False
+    st_after = get_state(session_id) or {}
+    if st_after.get("lead_stage") == "done":
+        end_session = True
 
+    return ChatResponse(
+        answer=answer,
+        citations=result.get("citations"),
+        debug=result.get("debug"),
+        end_session=end_session,  # NEW
+    )
 
 # ---------------------------
 # Tiny heuristic classifier (no LLM yet)
