@@ -40,7 +40,8 @@ class SearchHit(BaseModel):
 
 
 class SearchResponse(BaseModel):
-    hits: List[SearchHit] = []
+    # Use default_factory to avoid shared mutable defaults
+    hits: List[SearchHit] = Field(default_factory=list)
 
 
 # ---------------------------
@@ -50,7 +51,7 @@ class SearchResponse(BaseModel):
 class ChatRequest(BaseModel):
     session_id: Optional[str] = Field(
         default=None,
-        description="Client session identifier for short-term memory."
+        description="Client session identifier for short-term memory.",
     )
     question: str = Field(..., description="User's input text.")
 
@@ -64,10 +65,11 @@ class ChatRequest(BaseModel):
 class Citation(BaseModel):
     title: Optional[str] = None
     chunk_no: Optional[int] = None
+    source_uri: Optional[str] = None  # optional, if available
 
 
 class ChatResponse(BaseModel):
     answer: str
     citations: Optional[List[Citation]] = None
-    debug: Optional[dict] = None
-    end_session: bool = False   # NEW: UI can close on true
+    debug: Optional[Dict[str, Any]] = None
+    end_session: bool = False   # UI can close on true

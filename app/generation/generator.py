@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
-from app.core.utils import truncate, normalize_ws
+from app.core.utils import normalize_ws
 from app.retrieval.retriever import search
 
 # -----------------------------
@@ -41,16 +41,11 @@ def _split_user_and_ctx(q: str) -> Tuple[str, str]:
 
 def _extract_ctx_sections(ctx: str) -> Dict[str, str]:
     """
-    Very light parser: we expect lines like:
-      - Company contact:\n...
-      - Pricing:\n...
-      - Lead state: name=..., phone=..., email=..., preferred_time=...
-      Lead hint: ...
-    We’ll just pass these strings forward; the LLM can read them.
+    Light parser: pass through strings for the model to read.
+    We also pull an optional single-line 'Lead hint: ...'.
     """
     out: Dict[str, str] = {}
     out["raw"] = ctx or ""
-    # Lead hint (single line) if present
     m = _LEAD_HINT_RE.search(ctx or "")
     out["lead_hint"] = m.group(1).strip() if m else ""
     return out
@@ -79,7 +74,7 @@ def _planner(user_text: str, lead_hint: str = "") -> Dict[str, Any]:
       - kind: 'smalltalk' | 'lead' | 'contact' | 'pricing' | 'qa' | 'other'
       - needs_retrieval: bool
       - search_query: string or null
-      - lead_prompt: string or null   (e.g., the next question to ask)
+      - lead_prompt: string or null
     """
     system = (
         "You are a classifier/planner for a business assistant. "
@@ -90,7 +85,7 @@ def _planner(user_text: str, lead_hint: str = "") -> Dict[str, Any]:
         " lead_prompt: string|null}\n"
         "Rules:\n"
         "- 'smalltalk' for greetings/thanks.\n"
-        "- 'lead' if the user shows intent to start, asks for a callback, gives phone/email, or asks 'how to start'.\n"
+        "- 'lead' if user wants to start, asks for a callback, gives phone/email, or asks 'how to start'.\n"
         "- 'contact' if explicitly requesting email/phone/address/website.\n"
         "- 'pricing' if asking cost/fees/plans.\n"
         "- 'qa' for knowledge questions that require the KB.\n"
@@ -102,23 +97,22 @@ def _planner(user_text: str, lead_hint: str = "") -> Dict[str, Any]:
     raw = _chat(_PLANNER_MODEL, system, user, temperature=0.0)
 
     # Tolerant JSON extraction
-    try:
-        # Try direct parse
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
+    def _try_parse(s: str) -> Optional[Dict[str, Any]]:
+        try:
+            obj = json.loads(s)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
 
-    # Fallback: pull {...} substring
+    data = _try_parse(raw)
+    if data:
+        return data
+
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if m:
-        try:
-            data = json.loads(m.group(0))
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
+        data = _try_parse(m.group(0))
+        if data:
+            return data
 
     # Safe default
     return {"kind": "qa", "needs_retrieval": True, "search_query": user_text, "lead_prompt": None}
@@ -135,20 +129,24 @@ def _final_answer(
 ) -> str:
     """
     Second LLM pass: compose the actual reply using the retrieved evidence + facts.
-    Keep it short, friendly, specific, and ask only ONE thing if a lead_hint is present.
+    Keep it short, friendly, specific; ask only ONE thing if a lead_hint is present.
+    Use lead_state to avoid asking for info we already have.
     """
     system = (
         "You are Corah, a professional, friendly assistant for Corvox.\n"
-        "Goals:\n"
-        "1) Answer helpfully and concisely in a natural tone (no bullet-dumps unless asked).\n"
-        "2) Use retrieved evidence and company facts when relevant; never contradict them.\n"
-        "3) If a lead_hint is present, ask exactly one short follow-up question to move the lead forward.\n"
-        "4) If the user asked for contact details, provide only the requested items (email/phone/address/website), not all.\n"
-        "5) Avoid repeating the user's sentence verbatim. Paraphrase naturally.\n"
-        "6) If unsure, say so briefly and propose a next helpful step.\n"
+        "Style:\n"
+        "- Natural, concise (1–3 sentences unless the user requests detail).\n"
+        "- Vary phrasing; avoid robotic repetition.\n"
+        "Grounding:\n"
+        "- Use retrieved evidence and company facts when relevant; never contradict them.\n"
+        "Lead handling:\n"
+        "- Read the Lead State (name, phone, email, preferred_time). If a field is present, do NOT ask for it again.\n"
+        "- If a field is missing and a lead_hint is present, ask ONE short follow-up that advances the flow.\n"
+        "- If both phone and email are present, briefly acknowledge and move on; do not request them again.\n"
+        "- If the user was just making small talk, be friendly and do NOT push a lead question.\n"
+        "If unsure, say so briefly and suggest a next helpful step."
     )
 
-    # We provide sections the model can scan; keep them short.
     user = (
         f"User: {user_text}\n\n"
         f"[Company Contact]\n{contact_ctx or 'None'}\n\n"
@@ -156,7 +154,7 @@ def _final_answer(
         f"[Lead State]\n{lead_state_line}\n\n"
         f"[Retrieved Evidence]\n{retrieved_snippets or 'None'}\n\n"
         f"[Lead Hint]\n{lead_hint or 'None'}\n\n"
-        "Now respond as Corah. Keep it to 1–3 sentences unless the user asked for a list or detailed steps."
+        "Now respond as Corah."
     )
     return _chat(model, system, user, temperature=_TEMPERATURE)
 
@@ -182,7 +180,7 @@ def generate_answer(
     user_text, ctx_block = _split_user_and_ctx(question)
     ctx = _extract_ctx_sections(ctx_block)
 
-    # For the final pass, we need these strings available (we don’t parse deeply)
+    # For the final pass, we need these strings (we don’t parse deeply)
     contact_ctx = _extract_section(ctx_block, "Company contact")
     pricing_ctx = _extract_section(ctx_block, "Pricing")
     lead_state_line = _extract_line(ctx_block, "Lead state")
@@ -214,7 +212,7 @@ def generate_answer(
                 pieces.append(one)
                 total += len(one)
             retrieved_snippets = "\n\n".join(pieces)
-        except Exception as e:
+        except Exception:
             # If retrieval fails, proceed without it; LLM will answer generically
             retrieved_snippets = ""
             hits = []
@@ -230,20 +228,18 @@ def generate_answer(
         lead_hint=lead_hint,
     ).strip()
 
-    # Citations: surface doc titles/URIs when asked
+    # Citations: match schemas.ChatResponse -> List[Citation] (title, chunk_no)
     citations: List[Dict[str, Any]] = []
     if show_citations and hits:
         seen = set()
         for h in hits:
-            key = (h.get("title"), h.get("source_uri"))
+            key = (h.get("title"), h.get("chunk_no"))
             if key in seen:
                 continue
             seen.add(key)
             citations.append(
                 {
                     "title": h.get("title"),
-                    "source_uri": h.get("source_uri"),
-                    "document_id": h.get("document_id"),
                     "chunk_no": h.get("chunk_no"),
                 }
             )
@@ -264,27 +260,22 @@ def generate_answer(
 # Tiny helpers to pull sections/lines from the context block
 # -----------------------------
 
-_SECTION_RE = re.compile(r"^- ([^\n:]+):\s*(.*)$", re.MULTILINE)
-
 def _extract_section(ctx_block: str, header: str) -> str:
     """
     Given the raw [Context] block, pull the lines after “- <header>:”
-    until the next “- <other>:” or end. We keep it simple and robust.
+    until the next “- <other>:” or end. Keep it simple and robust.
     """
     if not ctx_block:
         return ""
-    # Find the header start
     pat = re.compile(rf"-\s*{re.escape(header)}\s*:\s*(.*)", re.IGNORECASE)
     m = pat.search(ctx_block)
     if not m:
         return ""
     start = m.end(0)
-    # Grab until next header marker "- Something:"
     tail = ctx_block[start:]
     nxt = re.search(r"^\s*-\s*[A-Za-z].*?:", tail, re.MULTILINE)
     chunk = tail[: nxt.start()] if nxt else tail
     text = (m.group(1) + "\n" + chunk).strip()
-    # Squash excessive whitespace
     return "\n".join(line.rstrip() for line in text.splitlines()).strip()
 
 def _extract_line(ctx_block: str, key: str) -> str:
