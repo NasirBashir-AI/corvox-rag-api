@@ -71,14 +71,30 @@ RETRIEVAL_TOP_K = _get_int("RETRIEVAL_TOP_K", 5)       # default top-k for retri
 # Query rewrite / self-querying
 ENABLE_SELF_QUERY = _get_bool("ENABLE_SELF_QUERY", True)
 
-# Router and retrieval feature flags (Phase A/B/C)
-ENABLE_SMALLTALK = _get_bool("ENABLE_SMALLTALK", True) # short-circuit greetings/small talk
+# Router and retrieval feature flags (legacy toggles; safe to ignore if unused)
+ENABLE_SMALLTALK = _get_bool("ENABLE_SMALLTALK", True) # legacy smalltalk bypass
 ENABLE_HYBRID    = _get_bool("ENABLE_HYBRID", True)    # vector + FTS blending in Postgres
 ENABLE_FACTS     = _get_bool("ENABLE_FACTS", True)     # use structured facts for contact/pricing if available
 
 # Lead capture / reporting
 USE_LLM_LEAD_SUMMARY = _get_bool("USE_LLM_LEAD_SUMMARY", True)
 LEAD_SUMMARY_MODEL   = os.getenv("LEAD_SUMMARY_MODEL", "gpt-4o-mini")
+
+# ---------- Lead flow guardrails & cooldowns ----------
+# Global nudger cooldown and budget
+LEAD_NUDGE_COOLDOWN_SEC = _get_int("LEAD_NUDGE_COOLDOWN_SEC", 60)
+LEAD_MAX_NUDGES         = _get_int("LEAD_MAX_NUDGES", 2)
+
+# Per-field "don't repeat" cool-downs (fallback to ASK_COOLDOWN_SEC)
+ASK_COOLDOWN_SEC        = _get_int("ASK_COOLDOWN_SEC", 45)
+ASK_COOLDOWN_NAME_SEC   = _get_int("ASK_COOLDOWN_NAME_SEC", ASK_COOLDOWN_SEC)
+ASK_COOLDOWN_PHONE_SEC  = _get_int("ASK_COOLDOWN_PHONE_SEC", ASK_COOLDOWN_SEC)
+ASK_COOLDOWN_EMAIL_SEC  = _get_int("ASK_COOLDOWN_EMAIL_SEC", ASK_COOLDOWN_SEC)
+ASK_COOLDOWN_TIME_SEC   = _get_int("ASK_COOLDOWN_TIME_SEC", ASK_COOLDOWN_SEC)
+ASK_COOLDOWN_NOTES_SEC  = _get_int("ASK_COOLDOWN_NOTES_SEC", ASK_COOLDOWN_SEC)
+
+# LLM fallback extractor thresholds
+NAME_LLM_MIN_CONF       = _get_float("NAME_LLM_MIN_CONF", 0.92)
 
 
 # ---------- API server defaults (used by run scripts, not FastAPI itself) ----------
@@ -114,3 +130,12 @@ if _get_bool("CONFIG_ECHO", False):
     print("[config] ENABLE_FACTS=", ENABLE_FACTS, flush=True)
     print("[config] USE_LLM_LEAD_SUMMARY=", USE_LLM_LEAD_SUMMARY, flush=True)
     print("[config] LEAD_SUMMARY_MODEL=", LEAD_SUMMARY_MODEL, flush=True)
+    print("[config] LEAD_NUDGE_COOLDOWN_SEC=", LEAD_NUDGE_COOLDOWN_SEC, flush=True)
+    print("[config] LEAD_MAX_NUDGES=", LEAD_MAX_NUDGES, flush=True)
+    print("[config] ASK_COOLDOWN_SEC=", ASK_COOLDOWN_SEC, flush=True)
+    print("[config] ASK_COOLDOWN_NAME_SEC=", ASK_COOLDOWN_NAME_SEC, flush=True)
+    print("[config] ASK_COOLDOWN_PHONE_SEC=", ASK_COOLDOWN_PHONE_SEC, flush=True)
+    print("[config] ASK_COOLDOWN_EMAIL_SEC=", ASK_COOLDOWN_EMAIL_SEC, flush=True)
+    print("[config] ASK_COOLDOWN_TIME_SEC=", ASK_COOLDOWN_TIME_SEC, flush=True)
+    print("[config] ASK_COOLDOWN_NOTES_SEC=", ASK_COOLDOWN_NOTES_SEC, flush=True)
+    print("[config] NAME_LLM_MIN_CONF=", NAME_LLM_MIN_CONF, flush=True)
