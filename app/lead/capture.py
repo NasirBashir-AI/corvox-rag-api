@@ -9,15 +9,7 @@ from typing import Optional, Tuple, Dict
 
 from app.core.session_mem import get_state, set_state, mark_asked, recently_asked
 from app.retrieval.leads import mark_stage, mark_done
-from app.core.config import (
-    LEAD_NUDGE_COOLDOWN_SEC,
-    LEAD_MAX_NUDGES,
-    ASK_COOLDOWN_NAME_SECS,
-    ASK_COOLDOWN_PHONE_SECS,
-    ASK_COOLDOWN_EMAIL_SECS,
-    ASK_COOLDOWN_TIME_SECS,
-    ASK_COOLDOWN_NOTES_SECS,
-)
+
 
 # ===== LLM fallback config (cheap + safe) =====
 _OPENAI_MODEL = os.getenv("OPENAI_EXTRACT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
