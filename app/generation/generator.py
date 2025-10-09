@@ -94,6 +94,12 @@ def _final_answer(
         "4) If a lead hint is present, ask exactly ONE short follow-up to progress the lead (no repeats).\n"
         "5) Do not dump all contact/pricing info. Provide only what was requested or what is necessary.\n"
         "6) If unsure, say so briefly and suggest the next helpful step.\n"
+        "7) Do NOT start replies with greetings (“Hi/Hello”) or repeat the user’s name every turn. "
+        "   Only acknowledge their name once, when you first capture it.\n"
+        "8) If the user asks to arrange a call/callback, you CAN arrange it."
+        "   Ask for exactly the next missing detail (name → phone/email → time), one short question at a time."
+        "   Do not tell them to email unless they explicitly ask for contact information.\n"
+        "9) Treat values in [User details] as the customer's contact only (for callbacks), never as Corvox’s."
     )
     user = (
         f"User: {user_text}\n\n"

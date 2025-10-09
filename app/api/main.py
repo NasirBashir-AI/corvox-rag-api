@@ -8,6 +8,7 @@ FastAPI entrypoint for Corah.
 """
 
 from __future__ import annotations
+import re
 from typing import List
 from datetime import datetime, timezone, timedelta
 
@@ -136,18 +137,21 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         next_prompt = lead_turn(session_id, q)
         lead_hint = f"Lead flow in progress. Ask this next, in a warm, concise way: {next_prompt}"
     else:
-        # simple trigger (heuristic); LLM classifier can replace this later
-        trigger = any(x in q.lower() for x in [
-            "start", "begin", "book a call", "call me", "can you call", "arrange a call",
-            "i want to start", "how do i start", "i'm ready", "let's go"
-        ]) or bool(phone or email)
+        # richer trigger: catches "callback", "call back", "schedule/set up/book/arrange a call", or phone/email given
+        q_lower = q.lower()
+        callback_re = r"\b(call\s*back|callback|schedule(?:\s+a)?\s+call|set\s*up(?:\s+a)?\s+call|book(?:\s+a)?\s+call|arrange(?:\s+a)?\s+call|arrange(?:\s+a)?\s*callback)\b"
 
-        # GUARD: do not (re)start if this session has already started a lead before,
-        # or if it's already marked done, or if we nudged very recently.
-        if trigger and (not already_started) and (not already_done) and (not recent_nudge):
+        trigger = (
+            bool(re.search(callback_re, q_lower))
+            or any(kw in q_lower for kw in ["start", "begin", "i want to start", "how do i start", "i'm ready", "let's go"])
+            or bool(phone or email)
+        )
+
+        # GUARD: do not (re)start if this session already started/done, or if we nudged very recently
+        if trigger and not (already_started or already_done or recent_nudge):
             first = lead_start(session_id, kind="callback")  # sets stage="name" and persists
             lead_hint = f"Start a lead capture (callback). Ask this first: {first}"
-            # set persistent "started" and cooldown timestamps
+            # mark started and start cooldown
             set_state(session_id, lead_started_at=now.isoformat(), lead_nudge_at=now.isoformat())
 
     # ----- 3) Facts for the LLM (contact/pricing) -----
@@ -240,9 +244,11 @@ def classify_lead_intent(turns: List[dict]) -> dict:
     t = text.lower()
 
     explicit_cta_terms = [
-        "book a call", "arrange a call", "call me", "can you call", "call back",
+        "callback", "call back",
+        "book a call", "schedule a call", "set up a call", "arrange a call",
+        "call me", "can you call",
         "how do i start", "let's start", "get started", "sign me up", "move forward",
-        "can we talk", "schedule a call", "set up a call"
+        "can we talk"
     ]
     buying_terms = [
         "i like this", "sounds good", "i’m interested", "i am interested",
