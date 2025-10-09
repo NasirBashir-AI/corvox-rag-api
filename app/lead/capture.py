@@ -12,8 +12,8 @@ from app.retrieval.leads import mark_stage, mark_done
 
 # ===== LLM fallback config (cheap + safe) =====
 _OPENAI_MODEL = os.getenv("OPENAI_EXTRACT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
-# Accept only when we’re confident and it passes our validators
-_NAME_LLM_MIN_CONF = float(os.getenv("NAME_LLM_MIN_CONF", "0.85"))
+# Be conservative to avoid false positives
+_NAME_LLM_MIN_CONF = float(os.getenv("NAME_LLM_MIN_CONF", "0.92"))
 
 _client = None
 def _get_client():
@@ -31,17 +31,20 @@ def _get_client():
 EMAIL_RE  = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 PHONE_RE  = re.compile(r"(\+?\d[\d\s().-]{7,}\d)")
 
-# Broadened name cues: I'm / I am / this is / my (full) name is / name is / name: / it's
+# Broadened name cues: I'm / I am / this is / my name is / name is / name: / it's
 NAME_RE   = re.compile(
-    r"\b(i'?m|i am|this is|my (?:full\s+)?name is|name is|name\s*:|it'?s)\s+([A-Za-z][A-Za-z\-\' ]{1,40})",
+    r"\b(i'?m|i am|this is|my name is|name is|name\s*:|it'?s)\s+([A-Za-z][A-Za-z\-\' ]{1,40})",
     re.I,
 )
 
+# Expanded stop words to block interrogatives and generic phrases from looking like names
 _STOP_WORDS = {
     "hi","hello","hey","ok","okay","thanks","thank","please",
     "email","phone","number","call","start","begin","book","callme",
     "price","pricing","cost","whatsapp","chatbot","bot","website","address",
-    "yes","yep","yeah","no","nope"
+    "yes","yep","yeah","no","nope",
+    # interrogatives / generic helpers
+    "what","why","how","when","where","who","can","could","would","does","do","help","service",
 }
 
 def harvest_email(text: str) -> Optional[str]:
@@ -62,22 +65,45 @@ def _normalize_person_name(raw: str) -> str:
         fixed.append(p[:1].upper() + p[1:].lower())
     return " ".join(fixed)
 
+def _starts_with_interrogative(s: str) -> bool:
+    s = (s or "").lstrip().lower()
+    for w in ("what","why","how","when","where","who","can","could","would","does","do","please","thanks"):
+        if s.startswith(w + " "):
+            return True
+    return False
+
+def _contains_contactish(s: str) -> bool:
+    """Reject strings that look like contact/time chatter rather than a name."""
+    sl = (s or "").lower()
+    if any(tok in sl for tok in ("number", "phone", "email", "call", "time", "am", "pm", "@", "http", "https", "whatsapp")):
+        return True
+    if any(ch.isdigit() for ch in sl):
+        return True
+    return False
+
 def _looks_like_person_name(s: str) -> bool:
+    """Heuristic to decide if a value plausibly looks like a person name."""
     if not s:
         return False
     s = s.strip()
     if len(s) < 2 or len(s) > 40:
         return False
-    if any(ch.isdigit() for ch in s):
+    # Hard blocks first
+    if _contains_contactish(s):
         return False
-    if "http" in s.lower() or "@" in s or "_" in s:
+    if _starts_with_interrogative(s):
         return False
+
     tokens = [t for t in re.split(r"\s+", s) if t]
     if not (1 <= len(tokens) <= 4):
         return False
+
+    # If most tokens are stop words, it's not a person name
     sw = sum(1 for t in tokens if t.lower() in _STOP_WORDS)
     if sw >= max(1, len(tokens) - 1):
         return False
+
+    # All tokens should look like name-ish words
     if not all(re.fullmatch(r"[A-Za-z][A-Za-z\-']*", t) for t in tokens):
         return False
     return True
@@ -93,9 +119,9 @@ def _llm_extract_name(text: str) -> Tuple[Optional[str], float]:
 
     system = (
         "Extract exactly one PERSON's name from the user's latest message. "
-        'Return compact JSON: {"name": string|null, "confidence": number}. '
+        "Return compact JSON: {\"name\": string|null, \"confidence\": number}. "
         "If there is no clear person name, use null and confidence 0. "
-        "Ignore company/product/brand names, emails, handles, URLs, phone numbers."
+        "Ignore company/product/brand names, emails, handles, URLs, and phone numbers."
     )
     user = f"User message:\n{text or ''}\n"
     try:
@@ -126,13 +152,13 @@ def _llm_extract_name(text: str) -> Tuple[Optional[str], float]:
 def harvest_name(text: str) -> Optional[str]:
     """
     Hybrid extraction:
-      1) Broadened regex
-      2) Plain-name heuristic (entire message looks like a name, tolerant to punctuation)
+      1) Broadened regex (cued names)
+      2) Plain-name heuristic (entire message looks like a short name)
       3) LLM fallback with confidence + validation
     """
     t = (text or "").strip()
 
-    # 1) Regex (leading cues)
+    # 1) Regex with cues
     m = NAME_RE.search(t)
     if m:
         raw = m.group(2).strip()
@@ -140,17 +166,12 @@ def harvest_name(text: str) -> Optional[str]:
         if _looks_like_person_name(nm):
             return nm
 
-    # 2) Plain-name heuristic — tolerant to surrounding words/punctuation.
-    #    Try the final chunk of letters (people often end with “…, Nasir”).
-    words = re.findall(r"[A-Za-z][A-Za-z\-']*", t)
-    if 1 <= len(words) <= 4:
-        candidate = _normalize_person_name(" ".join(words))
-        if _looks_like_person_name(candidate):
-            return candidate
-    if words:
-        tail = _normalize_person_name(words[-1])
-        if _looks_like_person_name(tail):
-            return tail
+    # 2) Plain-name heuristic (only letters, 1–4 tokens), and not contactish
+    tokens = [tok for tok in t.split() if tok]
+    if 1 <= len(tokens) <= 4 and all(re.fullmatch(r"[A-Za-z][A-Za-z\-']*", tok) for tok in tokens):
+        nm = _normalize_person_name(t)
+        if _looks_like_person_name(nm):
+            return nm
 
     # 3) LLM fallback
     nm, conf = _llm_extract_name(t)
@@ -183,11 +204,27 @@ def start(session_id: str, kind: str = "callback") -> str:
     mark_stage(session_id, stage="name", source="chat")
     return "Great — I can arrange that. What’s your name?"
 
-# Allow a name correction later without derailing the flow
+# Only allow name corrections with a cue or a pure short name;
+# never on messages that include contactish/time hints.
 def _maybe_update_name_from(text: str, session_id: str) -> Optional[str]:
-    new_name = harvest_name(text)
+    t = (text or "").strip()
+    if not t:
+        return None
+    if _contains_contactish(t):
+        return None
+
+    # Allow if message has a name cue, OR is a pure short name
+    has_cue = bool(NAME_RE.search(t))
+    tokens = [tok for tok in t.split() if tok]
+    pure_short = 1 <= len(tokens) <= 3 and all(re.fullmatch(r"[A-Za-z][A-Za-z\-']*", tok) for tok in tokens)
+
+    if not (has_cue or pure_short):
+        return None
+
+    new_name = harvest_name(t)
     if not new_name:
         return None
+
     st = get_state(session_id) or {}
     if st.get("name") != new_name:
         set_state(session_id, name=new_name)
@@ -220,7 +257,8 @@ def take_turn(session_id: str, text: str) -> str:
 
     # --- CONTACT ---
     if stage == "contact":
-        # Allow “actually it’s Alex” corrections without resetting
+        # Allow “actually it’s Alex” corrections without resetting,
+        # but only if the message looks like a name (cue or pure short), not contactish.
         corrected = _maybe_update_name_from(text, session_id)
 
         em = harvest_email(text)
@@ -230,7 +268,7 @@ def take_turn(session_id: str, text: str) -> str:
         if ph:
             set_state(session_id, phone=ph)
 
-        # Re-read minimal state snapshot after writes
+        # Re-read a minimal snapshot after writes
         st_now = get_state(session_id) or {}
         if not (st_now.get("email") or st_now.get("phone")):
             if corrected:
@@ -262,6 +300,7 @@ def take_turn(session_id: str, text: str) -> str:
             set_state(session_id, notes=notes)
 
         st = get_state(session_id) or {}
+        now_iso = _now_iso()
         mark_done(
             session_id,
             name=st.get("name"),
@@ -269,11 +308,13 @@ def take_turn(session_id: str, text: str) -> str:
             email=st.get("email"),
             preferred_time=st.get("preferred_time"),
             notes=st.get("notes") or notes or None,
-            done_at=_now_iso(),
+            done_at=now_iso,
         )
-        set_state(session_id, lead_stage="done", lead_done_at=_now_iso())
-        return "All set! I’ve logged your request and will close this chat now. We’ll be in touch shortly."
+        # one-shot flag so UI closes once, not forever
+        set_state(session_id, lead_stage="done", lead_done_at=now_iso, lead_just_done=True)
+        return "All set! I’ve logged your request. We’ll contact you shortly. Anything else I can help with?"
 
-    # --- DONE (or unknown) ---
-    set_state(session_id, lead_stage="done")
-    return "We’ve got your details noted and I’ll close this chat now. You can start a new chat anytime."
+    # --- DONE (follow-ups after completion) ---
+    if stage == "done":
+        # stage is already done; no need to change it again
+        return "We’ve got your details noted. I’ll close this chat now. You can start a new chat anytime."

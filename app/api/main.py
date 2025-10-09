@@ -168,15 +168,20 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         pricing_context += f"Key point: {facts['pricing_bullet']}\n"
 
     # ----- 4) Compose augmented question for the generator -----
-    lead_state_line = f"name={name or '-'}, phone={phone or '-'}, email={email or '-'}, preferred_time={state.get('preferred_time','-')}"
+    user_details = (
+        f"Name: {name or '-'}\n"
+        f"Phone: {phone or '-'}\n"
+        f"Email: {email or '-'}\n"
+        f"Preferred time: {state.get('preferred_time','-')}"
+    )
     lead_hint_text = f"\nLead hint: {lead_hint}" if lead_hint else ""
 
     augmented_q = (
         f"{q}\n\n"
         f"[Context]\n"
+        f"- User details:\n{user_details}\n"
         f"- Company contact:\n{contact_context or 'None'}\n"
         f"- Pricing:\n{pricing_context or 'None'}\n"
-        f"- Lead state: {lead_state_line}\n"
         f"{lead_hint_text}\n"
         f"[End Context]\n"
     )
@@ -207,17 +212,20 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         set_state(session_id, lead_started_at=now.isoformat(), lead_nudge_at=now.isoformat())
 
     append_turn(session_id, "assistant", answer)
-    # If the lead just completed, signal the UI to end the chat
+
+    # One-shot session close if we JUST finished the lead
     end_session = False
     st_after = get_state(session_id) or {}
-    if st_after.get("lead_stage") == "done":
+    if st_after.get("lead_just_done"):
         end_session = True
+        # clear the one-shot flag so subsequent turns don’t force-close
+        set_state(session_id, lead_just_done=False)
 
     return ChatResponse(
         answer=answer,
         citations=result.get("citations"),
         debug=result.get("debug"),
-        end_session=end_session,  # NEW
+        end_session=end_session,
     )
 
 # ---------------------------
