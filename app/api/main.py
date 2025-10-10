@@ -1,6 +1,5 @@
+# app/api/main.py
 """
-app/api/main.py
-
 FastAPI entrypoint for Corah.
 - /api/health  : liveness
 - /api/search  : retrieval-only probe
@@ -8,6 +7,7 @@ FastAPI entrypoint for Corah.
 """
 
 from __future__ import annotations
+
 import re
 from typing import List, Optional
 from datetime import datetime, timezone, timedelta
@@ -22,11 +22,10 @@ from app.api.schemas import (
     SearchHit,
     SearchResponse,
 )
-from app.core.config import (
-    RETRIEVAL_TOP_K,
-    LEAD_NUDGE_COOLDOWN_SEC,
-    LEAD_MAX_NUDGES,
-)
+
+# Import config as a module so we can safely default missing tunables
+from app.core import config as CFG
+
 from app.retrieval.retriever import search, get_facts
 from app.generation.generator import generate_answer
 from app.lead.capture import (
@@ -37,7 +36,18 @@ from app.lead.capture import (
     harvest_phone,
     harvest_name,
 )
-from app.core.session_mem import get_state, set_state, append_turn
+from app.core.session_mem import (
+    get_state,
+    set_state,
+    append_turn,
+    recent_turns,
+    mark_asked,
+    recently_asked,
+)
+
+# ---------------------------
+# App + CORS
+# ---------------------------
 
 app = FastAPI(
     title="Corah API",
@@ -47,10 +57,9 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
-# CORS (relax for dev; restrict in prod)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # tighten in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -69,7 +78,10 @@ def health() -> HealthResponse:
 # ---------------------------
 
 @app.get("/api/search", response_model=SearchResponse)
-def api_search(q: str = Query(..., min_length=1), k: int = Query(RETRIEVAL_TOP_K, ge=1, le=20)) -> SearchResponse:
+def api_search(
+    q: str = Query(..., min_length=1),
+    k: int = Query(getattr(CFG, "RETRIEVAL_TOP_K", 5), ge=1, le=20),
+) -> SearchResponse:
     try:
         hits_raw = search(q, k=k)
         hits: List[SearchHit] = [
@@ -88,6 +100,68 @@ def api_search(q: str = Query(..., min_length=1), k: int = Query(RETRIEVAL_TOP_K
         raise HTTPException(status_code=500, detail=f"search_failed: {type(e).__name__}: {e}")
 
 # ---------------------------
+# Helpers (orchestration)
+# ---------------------------
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _cooldown_ok(last_iso: Optional[str], cooldown_sec: int) -> bool:
+    if not last_iso:
+        return True
+    try:
+        last = datetime.fromisoformat(last_iso)
+    except Exception:
+        return True
+    return (_now_utc() - last) >= timedelta(seconds=cooldown_sec)
+
+def _compute_last_asked(state: dict) -> Optional[str]:
+    # Pick the most recent asked_for_* timestamp, return its field key
+    fields = ("name", "contact", "time", "notes")
+    latest_field = None
+    latest_ts = None
+    for f in fields:
+        t_iso = state.get(f"asked_for_{f}_at")
+        if not t_iso:
+            continue
+        try:
+            ts = datetime.fromisoformat(t_iso)
+        except Exception:
+            continue
+        if latest_ts is None or ts > latest_ts:
+            latest_ts = ts
+            latest_field = f
+    return latest_field
+
+def _decide_hint_from_stage(state: dict) -> Optional[str]:
+    """
+    Map current lead_stage + known values to a compact hint the LLM can phrase.
+    """
+    stage = state.get("lead_stage") or None
+    if stage == "done":
+        return "confirm_done"
+
+    # Ask mapping by stage
+    if stage == "name":
+        return "ask_name"
+
+    if stage == "contact":
+        # if either phone or email already present, controller should have advanced
+        # but if not, we need contact
+        has_phone = bool(state.get("phone"))
+        has_email = bool(state.get("email"))
+        return None if (has_phone or has_email) else "ask_contact"
+
+    if stage == "time":
+        return "ask_time" if not state.get("preferred_time") else None
+
+    if stage == "notes":
+        # notes is optional; still ask once, then controller will mark done
+        return "ask_notes"
+
+    return None
+
+# ---------------------------
 # Chat (LLM-first orchestration)
 # ---------------------------
 
@@ -95,128 +169,112 @@ def api_search(q: str = Query(..., min_length=1), k: int = Query(RETRIEVAL_TOP_K
 def api_chat(req: ChatRequest) -> ChatResponse:
     """
     LLM-first sandwich:
-      1) Planner LLM (classify/route)
+      1) Planner (classify/route)
       2) Retrieval (if needed)
-      3) Final LLM (compose) — with controller (capture.py) owning the flow/stage via signals
+      3) Final composer — with controller (capture.py) owning the flow/stage via state,
+         and the LLM phrasing the response using compact hints.
     """
     q = (req.question or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="empty_question")
 
     session_id = req.session_id
-    now = datetime.now(timezone.utc)
+    now = _now_utc()
 
-    # record the user turn so heuristics/LLM see the latest message
+    # record the user turn so both heuristics & LLM see the latest message
     append_turn(session_id, "user", q)
 
     # ----- 1) Opportunistic short-term memory (light harvest) -----
-    state = get_state(session_id)  # durable JSONB row
+    state = get_state(session_id)  # durable JSONB state (merged with defaults)
 
+    # opportunistically harvest user-provided PII (never overwrite with None)
     name  = harvest_name(q)   or state.get("name")
     phone = harvest_phone(q)  or state.get("phone")
     email = harvest_email(q)  or state.get("email")
     set_state(session_id, name=name, phone=phone, email=email)
 
-    # Guards
-    state = get_state(session_id)  # refresh after possible set
+    # Read guards / tunables
     already_started = bool(state.get("lead_started_at"))
     already_done    = bool(state.get("lead_done_at"))
     nudge_at_iso    = state.get("lead_nudge_at")
     nudge_count     = int(state.get("lead_nudge_count") or 0)
-    recent_nudge    = False
-    if nudge_at_iso:
-        try:
-            last_dt = datetime.fromisoformat(nudge_at_iso)
-            recent_nudge = (now - last_dt) < timedelta(seconds=LEAD_NUDGE_COOLDOWN_SEC)
-        except Exception:
-            recent_nudge = False
 
-    # ----- 2) Controller step (logic only) -----
-    # Either we are already in a flow, or decide whether to start one.
-    hint_str: Optional[str] = None
+    LEAD_NUDGE_COOLDOWN_SEC = getattr(CFG, "LEAD_NUDGE_COOLDOWN_SEC", 60)
+    LEAD_MAX_NUDGES         = getattr(CFG, "LEAD_MAX_NUDGES", 2)
+
+    ASK_COOLDOWN_NAME_SEC    = getattr(CFG, "ASK_COOLDOWN_NAME_SEC", 45)
+    ASK_COOLDOWN_CONTACT_SEC = getattr(CFG, "ASK_COOLDOWN_CONTACT_SEC", 45)
+    ASK_COOLDOWN_TIME_SEC    = getattr(CFG, "ASK_COOLDOWN_TIME_SEC", 45)
+    ASK_COOLDOWN_NOTES_SEC   = getattr(CFG, "ASK_COOLDOWN_NOTES_SEC", 45)
+
+    recent_nudge = not _cooldown_ok(nudge_at_iso, LEAD_NUDGE_COOLDOWN_SEC)
+
+    # ----- 2) Controller (logic owner): advance/persist state, then decide hint -----
+    hint: Optional[str] = None
 
     if lead_in_progress(session_id):
-        # Let controller process the user message and update stage/state.
-        _ = lead_turn(session_id, q)
+        # Advance the machine with the user's text (controller persists data/stage internally)
+        _ = lead_turn(session_id, q)  # return value ignored on purpose (LLM will phrase)
+        state = get_state(session_id)  # re-read after controller updates
+
+        # derive the next ask from current state
+        hint = _decide_hint_from_stage(state)
+
     else:
-        # Intent trigger (richer CTA matcher) to start capture
+        # Not in progress — see if the user intent should *start* capture
         ql = q.lower()
         callback_re = r"\b(call\s*back|callback|schedule(?:\s+a)?\s+call|set\s*up(?:\s+a)?\s+call|book(?:\s+a)?\s+call|arrange(?:\s+a)?\s+call|arrange(?:\s+a)?\s*callback)\b"
         trigger = (
             bool(re.search(callback_re, ql))
             or any(kw in ql for kw in ["start", "begin", "i want to start", "how do i start", "i'm ready", "let's go"])
-            or bool(phone or email)
+            or bool(phone or email)  # user volunteered contact — good signal to start
         )
+
         can_nudge = (not already_started) and (not already_done) and (not recent_nudge) and (nudge_count < LEAD_MAX_NUDGES)
         if trigger and can_nudge:
-            # Begin flow (controller sets stage="name" and persists)
+            # Start the flow (controller sets stage='name' and persists)
             _ = lead_start(session_id, kind="callback")
+            # mark nudge budget + timestamp + started
             set_state(
                 session_id,
                 lead_started_at=now.isoformat(),
                 lead_nudge_at=now.isoformat(),
                 lead_nudge_count=nudge_count + 1,
             )
+            state = get_state(session_id)
+            hint = "ask_name"
 
-    # After controller step, decide exactly ONE hint based on current stage and last_asked
-    st_now = get_state(session_id) or {}
-    stage = st_now.get("lead_stage")  # name | contact | time | notes | done
+    # ----- 3) One-ask policy with cooldowns (avoid repetition) -----
+    # If we intend to ask again but have just asked this field, switch to bridge_back_to_<field>.
+    last_asked = _compute_last_asked(state)
 
-    # Build last_asked from timestamps we store
-    def _parse_iso(s: Optional[str]):
-        try:
-            return datetime.fromisoformat(s) if s else None
-        except Exception:
-            return None
+    if hint and hint.startswith("ask_"):
+        field = hint.split("ask_", 1)[1]  # name|contact|time|notes
+        # choose proper cooldown per field
+        field_cooldown = {
+            "name":    ASK_COOLDOWN_NAME_SEC,
+            "contact": ASK_COOLDOWN_CONTACT_SEC,
+            "time":    ASK_COOLDOWN_TIME_SEC,
+            "notes":   ASK_COOLDOWN_NOTES_SEC,
+        }.get(field, 45)
 
-    asked_times = {
-        "name":  _parse_iso(st_now.get("asked_for_name_at")),
-        # combine phone/email into "contact"
-        "phone": _parse_iso(st_now.get("asked_for_phone_at")),
-        "email": _parse_iso(st_now.get("asked_for_email_at")),
-        "time":  _parse_iso(st_now.get("asked_for_time_at")),
-        "notes": _parse_iso(st_now.get("asked_for_notes_at")),
-    }
-    # Reduce to name/contact/time/notes for last_asked
-    contact_time = max([t for k, t in asked_times.items() if k in ("phone", "email") and t], default=None)
-    collapsed = {
-        "name": asked_times["name"],
-        "contact": contact_time,
-        "time": asked_times["time"],
-        "notes": asked_times["notes"],
-    }
-    last_asked: Optional[str] = None
-    if any(v is not None for v in collapsed.values()):
-        last_asked = max(
-            ((k, v) for k, v in collapsed.items() if v is not None),
-            key=lambda kv: kv[1]
-        )[0]
-
-    # Map stage -> intended ask field
-    ask_field: Optional[str] = None
-    if stage == "name":
-        ask_field = "name"
-    elif stage == "contact":
-        ask_field = "contact"
-    elif stage == "time":
-        ask_field = "time"
-    elif stage == "notes":
-        ask_field = "notes"
-    elif stage == "done":
-        ask_field = None
-
-    if ask_field:
-        if last_asked == ask_field:
-            hint_str = f"bridge_back_to_{ask_field}"
+        if last_asked == field and recently_asked(session_id, field, field_cooldown):
+            # don't repeat; gently bridge back
+            hint = f"bridge_back_to_{field}"
         else:
-            # phrase contact as 'phone_or_email' to be explicit for the LLM
-            hint_str = "ask_phone_or_email" if ask_field == "contact" else f"ask_{ask_field}"
-    else:
-        # flow is done => a single confirmation
-        if stage == "done":
-            hint_str = "confirm_done"
+            # stamp that we are asking this field now
+            mark_asked(session_id, field)
 
-    # ----- 3) Facts for the LLM (contact/pricing) -----
+    # If stage is done, ensure we signal a one-shot close to the UI
+    end_session = False
+    st_after = get_state(session_id) or {}
+    if st_after.get("lead_just_done"):
+        end_session = True
+        # clear the one-shot flag so subsequent turns don’t force-close
+        set_state(session_id, lead_just_done=False)
+
+    # ----- 4) Facts & context assembly for the final LLM -----
+    # Company facts
     fact_names = ["contact_email", "contact_phone", "contact_url", "office_address",
                   "pricing_bullet", "pricing_overview"]
     facts = get_facts(fact_names) or {}
@@ -233,22 +291,24 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     if facts.get("pricing_bullet"):
         pricing_context += f"Key point: {facts['pricing_bullet']}\n"
 
-    # ----- 4) Compose augmented question for the generator -----
+    # User details block for the model (never echoed as company info)
+    # Use fresh state after any controller updates
+    state = get_state(session_id) or {}
     user_details = (
-        f"Name: {st_now.get('name') or '-'}\n"
-        f"Phone: {st_now.get('phone') or '-'}\n"
-        f"Email: {st_now.get('email') or '-'}\n"
-        f"Preferred time: {st_now.get('preferred_time') or '-'}"
+        f"Name: {state.get('name') or '-'}\n"
+        f"Phone: {state.get('phone') or '-'}\n"
+        f"Email: {state.get('email') or '-'}\n"
+        f"Preferred time: {state.get('preferred_time') or '-'}"
     )
 
-    lead_hint_line  = f"Lead hint: {hint_str}" if hint_str else ""
-    last_asked_line = f"last_asked: {last_asked}" if last_asked else ""
-
+    # Hints passed as plain lines in [Context] for generator.py to read
     hint_lines = ""
-    if lead_hint_line:
-        hint_lines += lead_hint_line + "\n"
-    if last_asked_line:
-        hint_lines += last_asked_line + "\n"
+    if hint:
+        hint_lines += f"Lead hint: {hint}\n"
+
+    last_asked_field = _compute_last_asked(state)
+    if last_asked_field:
+        hint_lines += f"last_asked: {last_asked_field}\n"
 
     augmented_q = (
         f"{q}\n\n"
@@ -263,7 +323,7 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     # ----- 5) LLM sandwich (planner -> retrieval -> final) -----
     result = generate_answer(
         question=augmented_q,
-        k=req.k or RETRIEVAL_TOP_K,
+        k=getattr(CFG, "RETRIEVAL_TOP_K", 5) if (req.k is None) else req.k,
         max_context_chars=req.max_context or 3000,
         debug=req.debug,
         show_citations=req.citations,
@@ -271,14 +331,6 @@ def api_chat(req: ChatRequest) -> ChatResponse:
 
     answer = (result.get("answer") or "").strip()
     append_turn(session_id, "assistant", answer)
-
-    # One-shot session close if we JUST finished the lead
-    end_session = False
-    st_after = get_state(session_id) or {}
-    if st_after.get("lead_just_done"):
-        end_session = True
-        # clear the one-shot flag so subsequent turns don’t force-close
-        set_state(session_id, lead_just_done=False)
 
     return ChatResponse(
         answer=answer,
@@ -288,7 +340,7 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     )
 
 # ---------------------------
-# Tiny heuristic classifier (kept for future analytics if needed)
+# (Optional) Heuristic classifier kept for future analytics
 # ---------------------------
 
 def classify_lead_intent(turns: List[dict]) -> dict:
