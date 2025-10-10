@@ -7,6 +7,17 @@ import json
 from datetime import datetime, timezone
 from typing import Optional, Tuple, Dict, Any
 
+# session state helpers
+from app.core.session_mem import (
+    get_state,
+    set_state,
+    mark_asked,
+    recently_asked,
+)
+
+# DB persistence for leads
+from app.retrieval.leads import mark_stage, mark_done
+
 # ---- cooldown config (defensive import) ----
 try:
     from app.core.config import (
@@ -183,8 +194,9 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def in_progress(session_id: str) -> bool:
-    st = get_state(session_id)
-    return bool((st or {}).get("lead_stage") not in (None, "", "done"))
+    st = get_state(session_id) or {}
+    lead_stage = st.get("lead_stage")
+    return bool(lead_stage and lead_stage != "done")
 
 def start(session_id: str, kind: str = "callback") -> Dict[str, Any]:
     """
