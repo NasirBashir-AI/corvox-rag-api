@@ -7,20 +7,28 @@ import json
 from datetime import datetime, timezone
 from typing import Optional, Tuple, Dict, Any
 
-from app.core.session_mem import (
-    get_state,
-    set_state,
-    mark_asked,
-    recently_asked,
-)
-from app.retrieval.leads import mark_stage, mark_done
-from app.core.config import (
-    ASK_COOLDOWN_NAME_SECS,
-    ASK_COOLDOWN_PHONE_SECS,
-    ASK_COOLDOWN_EMAIL_SECS,
-    ASK_COOLDOWN_TIME_SECS,
-    ASK_COOLDOWN_NOTES_SECS,
-)
+# ---- cooldown config (defensive import) ----
+try:
+    from app.core.config import (
+        ASK_COOLDOWN_NAME_SECS,
+        ASK_COOLDOWN_PHONE_SECS,
+        ASK_COOLDOWN_EMAIL_SECS,
+        ASK_COOLDOWN_TIME_SECS,
+        ASK_COOLDOWN_NOTES_SECS,
+    )
+except Exception:
+    import os
+    def _as_int(name: str, default: int) -> int:
+        try:
+            return int(os.getenv(name, str(default)))
+        except Exception:
+            return default
+    # fallbacks so the app never 500s if config isn’t up to date
+    ASK_COOLDOWN_NAME_SECS  = _as_int("ASK_COOLDOWN_NAME_SECS", 45)
+    ASK_COOLDOWN_PHONE_SECS = _as_int("ASK_COOLDOWN_PHONE_SECS", 45)
+    ASK_COOLDOWN_EMAIL_SECS = _as_int("ASK_COOLDOWN_EMAIL_SECS", 45)
+    ASK_COOLDOWN_TIME_SECS  = _as_int("ASK_COOLDOWN_TIME_SECS", 45)
+    ASK_COOLDOWN_NOTES_SECS = _as_int("ASK_COOLDOWN_NOTES_SECS", 45)
 
 # ===== LLM fallback config (cheap + safe) =====
 _OPENAI_MODEL = os.getenv("OPENAI_EXTRACT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
