@@ -37,7 +37,7 @@ from app.lead.capture import (
     harvest_phone,
     harvest_name,
 )
-from app.core.session_mem import get_state, set_state, append_turn, recent_turns
+from app.core.session_mem import get_state, set_state, append_turn
 
 app = FastAPI(
     title="Corah API",
@@ -111,12 +111,14 @@ def api_chat(req: ChatRequest) -> ChatResponse:
 
     # ----- 1) Opportunistic short-term memory (light harvest) -----
     state = get_state(session_id)  # durable JSONB row
+
     name  = harvest_name(q)   or state.get("name")
     phone = harvest_phone(q)  or state.get("phone")
     email = harvest_email(q)  or state.get("email")
     set_state(session_id, name=name, phone=phone, email=email)
 
     # Guards
+    state = get_state(session_id)  # refresh after possible set
     already_started = bool(state.get("lead_started_at"))
     already_done    = bool(state.get("lead_done_at"))
     nudge_at_iso    = state.get("lead_nudge_at")
@@ -129,12 +131,15 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         except Exception:
             recent_nudge = False
 
-    # ----- 2) Controller signals (no copy) -----
-    lead_signal = None  # e.g., {"hint":"ask_contact"} | {"hint":"bridge_back_to_time"} | {"hint":"confirm_done"}
+    # ----- 2) Controller step (logic only) -----
+    # Either we are already in a flow, or decide whether to start one.
+    hint_str: Optional[str] = None
+
     if lead_in_progress(session_id):
-        lead_signal = lead_turn(session_id, q)
+        # Let controller process the user message and update stage/state.
+        _ = lead_turn(session_id, q)
     else:
-        # Intent trigger (richer CTA matcher)
+        # Intent trigger (richer CTA matcher) to start capture
         ql = q.lower()
         callback_re = r"\b(call\s*back|callback|schedule(?:\s+a)?\s+call|set\s*up(?:\s+a)?\s+call|book(?:\s+a)?\s+call|arrange(?:\s+a)?\s+call|arrange(?:\s+a)?\s*callback)\b"
         trigger = (
@@ -142,12 +147,10 @@ def api_chat(req: ChatRequest) -> ChatResponse:
             or any(kw in ql for kw in ["start", "begin", "i want to start", "how do i start", "i'm ready", "let's go"])
             or bool(phone or email)
         )
-
         can_nudge = (not already_started) and (not already_done) and (not recent_nudge) and (nudge_count < LEAD_MAX_NUDGES)
         if trigger and can_nudge:
-            signal = lead_start(session_id, kind="callback")  # {"hint":"ask_name"}
-            lead_signal = signal
-            # bump nudge budget & timestamp, and mark started
+            # Begin flow (controller sets stage="name" and persists)
+            _ = lead_start(session_id, kind="callback")
             set_state(
                 session_id,
                 lead_started_at=now.isoformat(),
@@ -155,12 +158,63 @@ def api_chat(req: ChatRequest) -> ChatResponse:
                 lead_nudge_count=nudge_count + 1,
             )
 
-    # Map controller signal to a compact hint string for the generator
-    hint_str: Optional[str] = None
-    if isinstance(lead_signal, dict) and lead_signal.get("hint"):
-        h = lead_signal["hint"]
-        # Normalize to ask=<field> / bridge_back_to_<field> / confirm_done / after_done
-        hint_str = h
+    # After controller step, decide exactly ONE hint based on current stage and last_asked
+    st_now = get_state(session_id) or {}
+    stage = st_now.get("lead_stage")  # name | contact | time | notes | done
+
+    # Build last_asked from timestamps we store
+    def _parse_iso(s: Optional[str]):
+        try:
+            return datetime.fromisoformat(s) if s else None
+        except Exception:
+            return None
+
+    asked_times = {
+        "name":  _parse_iso(st_now.get("asked_for_name_at")),
+        # combine phone/email into "contact"
+        "phone": _parse_iso(st_now.get("asked_for_phone_at")),
+        "email": _parse_iso(st_now.get("asked_for_email_at")),
+        "time":  _parse_iso(st_now.get("asked_for_time_at")),
+        "notes": _parse_iso(st_now.get("asked_for_notes_at")),
+    }
+    # Reduce to name/contact/time/notes for last_asked
+    contact_time = max([t for k, t in asked_times.items() if k in ("phone", "email") and t], default=None)
+    collapsed = {
+        "name": asked_times["name"],
+        "contact": contact_time,
+        "time": asked_times["time"],
+        "notes": asked_times["notes"],
+    }
+    last_asked: Optional[str] = None
+    if any(v is not None for v in collapsed.values()):
+        last_asked = max(
+            ((k, v) for k, v in collapsed.items() if v is not None),
+            key=lambda kv: kv[1]
+        )[0]
+
+    # Map stage -> intended ask field
+    ask_field: Optional[str] = None
+    if stage == "name":
+        ask_field = "name"
+    elif stage == "contact":
+        ask_field = "contact"
+    elif stage == "time":
+        ask_field = "time"
+    elif stage == "notes":
+        ask_field = "notes"
+    elif stage == "done":
+        ask_field = None
+
+    if ask_field:
+        if last_asked == ask_field:
+            hint_str = f"bridge_back_to_{ask_field}"
+        else:
+            # phrase contact as 'phone_or_email' to be explicit for the LLM
+            hint_str = "ask_phone_or_email" if ask_field == "contact" else f"ask_{ask_field}"
+    else:
+        # flow is done => a single confirmation
+        if stage == "done":
+            hint_str = "confirm_done"
 
     # ----- 3) Facts for the LLM (contact/pricing) -----
     fact_names = ["contact_email", "contact_phone", "contact_url", "office_address",
@@ -181,26 +235,13 @@ def api_chat(req: ChatRequest) -> ChatResponse:
 
     # ----- 4) Compose augmented question for the generator -----
     user_details = (
-        f"Name: {name or '-'}\n"
-        f"Phone: {phone or '-'}\n"
-        f"Email: {email or '-'}\n"
-        f"Preferred time: {state.get('preferred_time','-')}"
+        f"Name: {st_now.get('name') or '-'}\n"
+        f"Phone: {st_now.get('phone') or '-'}\n"
+        f"Email: {st_now.get('email') or '-'}\n"
+        f"Preferred time: {st_now.get('preferred_time') or '-'}"
     )
 
-    # derive last_asked from the timestamps we keep in session (if any)
-    last_asked: Optional[str] = None
-    ts_map = {}
-    for field in ("name", "contact", "time", "notes"):
-        t_iso = state.get(f"asked_for_{field}_at")
-        if t_iso:
-            try:
-                ts_map[field] = datetime.fromisoformat(t_iso)
-            except Exception:
-                pass
-    if ts_map:
-        last_asked = max(ts_map.items(), key=lambda kv: kv[1])[0]
-
-    lead_hint_line = f"Lead hint: {hint_str}" if hint_str else ""
+    lead_hint_line  = f"Lead hint: {hint_str}" if hint_str else ""
     last_asked_line = f"last_asked: {last_asked}" if last_asked else ""
 
     hint_lines = ""

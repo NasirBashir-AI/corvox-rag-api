@@ -10,7 +10,6 @@ from typing import Optional, Tuple, Dict
 from app.core.session_mem import get_state, set_state, mark_asked, recently_asked
 from app.retrieval.leads import mark_stage, mark_done
 
-
 # ===== LLM fallback config (cheap + safe) =====
 _OPENAI_MODEL = os.getenv("OPENAI_EXTRACT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 # Be conservative to avoid false positives
