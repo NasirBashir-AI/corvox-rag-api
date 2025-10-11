@@ -51,7 +51,7 @@ SHOW_CITATIONS  = _get_bool("SHOW_CITATIONS", False)   # include lightweight cit
 DEBUG_RAG       = _get_bool("DEBUG_RAG", False)        # include retrieval debug info in API output
 
 # LLM style (warmer but still concise)
-TEMPERATURE     = _get_float("TEMPERATURE", 0.2)
+TEMPERATURE     = _get_float("TEMPERATURE", 0.5)
 MAX_TOKENS      = _get_int("MAX_TOKENS", 700)
 MIN_SIM         = _get_float("MIN_SIM", 0.60)
 RETRIEVAL_TOP_K = _get_int("RETRIEVAL_TOP_K", 5)
