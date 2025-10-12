@@ -13,43 +13,34 @@ from app.retrieval.retriever import search
 # -----------------------------
 # Config
 # -----------------------------
-
 _PLANNER_MODEL = os.getenv("OPENAI_PLANNER_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 _FINAL_MODEL   = os.getenv("OPENAI_FINAL_MODEL",   os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
-_TEMPERATURE   = float(os.getenv("TEMPERATURE", "0.5"))
+_TEMPERATURE   = float(os.getenv("TEMPERATURE", "0.5"))  # friendlier, still tidy
 
 _client = OpenAI()
 
 # -----------------------------
 # Context parsing helpers
 # -----------------------------
-
 _CTX_START = "[Context]"
 _CTX_END   = "[End Context]"
 
-# Lines we inject from main.py:
-#   Lead hint: ask_name | ask_contact | ask_time | ask_notes | bridge_back_to_<field> | confirm_done | after_done
-#   last_asked: name|contact|time|notes
-_LEAD_HINT_RE  = re.compile(r"^Lead hint:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
-_LAST_ASKED_RE = re.compile(r"^last_asked:\s*(\w+)\s*$", re.IGNORECASE | re.MULTILINE)
+_LEAD_HINT_RE   = re.compile(r"^Lead hint:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+_LAST_ASKED_RE  = re.compile(r"^last_asked:\s*([A-Za-z_]+)\s*$", re.IGNORECASE | re.MULTILINE)
+_CUR_TOPIC_RE   = re.compile(r"^current_topic:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+_EARLIER_RE     = re.compile(r"^Earlier mention:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 
 def _split_user_and_ctx(q: str) -> Tuple[str, str]:
+    """Split original user text and the injected [Context] block (if present)."""
     if _CTX_START in q and _CTX_END in q:
         head, rest = q.split(_CTX_START, 1)
         ctx, _ = rest.split(_CTX_END, 1)
         return head.strip(), ctx.strip()
     return q.strip(), ""
 
-def _extract_line(ctx_block: str, key: str) -> str:
-    if not ctx_block:
-        return ""
-    m = re.search(rf"{re.escape(key)}\s*:\s*(.+)", ctx_block, re.IGNORECASE)
-    return (m.group(1).strip() if m else "")
-
 def _extract_section(ctx_block: str, header: str) -> str:
     """
-    Given the raw [Context] block, pull the lines after “- <header>:”
-    until the next “- <other>:” or end. Robust to minor formatting.
+    Pull the lines after “- <header>:” until the next “- <other>:” or end.
     """
     if not ctx_block:
         return ""
@@ -64,95 +55,63 @@ def _extract_section(ctx_block: str, header: str) -> str:
     text = (m.group(1) + "\n" + chunk).strip()
     return "\n".join(line.rstrip() for line in text.splitlines()).strip()
 
-def _extract_ctx_bits(ctx: str) -> Dict[str, Optional[str]]:
-    out: Dict[str, Optional[str]] = {"lead_hint": None, "last_asked": None}
+def _extract_ctx_fields(ctx: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
     if not ctx:
         return out
-    m1 = _LEAD_HINT_RE.search(ctx)
-    if m1:
-        out["lead_hint"] = (m1.group(1) or "").strip()
-    m2 = _LAST_ASKED_RE.search(ctx)
-    if m2:
-        out["last_asked"] = (m2.group(1) or "").strip().lower()
+    m = _LEAD_HINT_RE.search(ctx)
+    if m: out["lead_hint"] = m.group(1).strip()
+    m = _LAST_ASKED_RE.search(ctx)
+    if m: out["last_asked"] = m.group(1).strip().lower()
+    m = _CUR_TOPIC_RE.search(ctx)
+    if m: out["current_topic"] = m.group(1).strip()
+    m = _EARLIER_RE.search(ctx)
+    if m: out["earlier_mention"] = m.group(1).strip()
     return out
 
 # -----------------------------
 # LLM calls
 # -----------------------------
-
 def _chat(model: str, system: str, user: str, temperature: float = _TEMPERATURE) -> str:
-    try:
-        resp = _client.chat.completions.create(
-            model=model,
-            temperature=temperature,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception:
-        # Very defensive fallback to avoid 500s
-        return "Sorry—I'm having trouble phrasing that right now. Could you rephrase or ask again?"
+    resp = _client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 def _planner(user_text: str, lead_hint: str = "") -> Dict[str, Any]:
     """
-    First-pass LLM “planner”: classify and (optionally) rewrite a search query.
-    Return JSON with keys:
-      - kind: 'smalltalk' | 'lead' | 'contact' | 'pricing' | 'qa' | 'other'
-      - needs_retrieval: bool
-      - search_query: string or null
+    First pass: lightweight route/plan.
+    We DO NOT answer here; return compact JSON only.
     """
     system = (
-        "You are Corah, Corvox’s friendly front-desk assistant. Voice: warm, calm, and practical. "
-        "Be human, not salesy.\n"
-        "\n"
-        "Style & tone (obey):\n"
-        "• Default to 1–3 short sentences. Ask at most ONE short question only when it moves things forward.\n"
-        "• Do NOT mirror or restate the user’s intent (“It sounds like you’re interested in…”). Move to the next useful step.\n"
-        "• No auto-greetings after the first turn. Use the user’s name only when you first learn it or when it’s naturally helpful.\n"
-        "• Stay on topic. Tailor answers to the user’s industry and cues; avoid generic capability lists.\n"
-        "• Prefer concrete, specific ideas over abstractions. (E.g., for a jewellery shop WhatsApp bot: appointment booking, repair/collection updates, new-drop alerts.)\n"
-        "\n"
-        "Lead flow (when hints are present):\n"
-        "• If you have a lead hint, ask ONLY the next missing detail. Do not repeat the same ask in back-to-back turns. "
-        "  If last_asked equals the current ask target, briefly acknowledge and gently bridge back.\n"
-        "• If the hint is confirm_done, reply with a warm one-line confirmation that recaps name, phone/email, preferred time, and any note—then reassure next steps.\n"
-        "• If the user declines to share contact, respect it. Offer one alternative (the company email) once, then continue helping without pushing.\n"
-        "\n"
-        "Grounding:\n"
-        "• Use [Company contact] ONLY for Corvox details. NEVER present [User details] as company contact. If company info is missing, say so briefly.\n"
-        "• When asked to “tell me more”, answer with 3–5 crisp bullets relevant to their scenario—no fluff, no boilerplate.\n"
-        "• Avoid filler phrases like “it sounds like…”, “we can create custom solutions…”, or repeating what they just said.\n"
-        "\n"
-        "Style examples:\n"
-        "- User: “What could a WhatsApp bot do for my jewellery shop?”\n"
-        "  You: “A few high-impact ideas:\n"
-        "  • Book viewings & repairs with reminders\n"
-        "  • ‘New drop’ & back-in-stock alerts for specific collections\n"
-        "  • Order/repair status updates and care tips\n"
-        "  • Quick answers on metals, sizing, returns\n"
-        "  Want me to sketch a quick flow?”\n"
-        "\n"
-        "- (Lead hint: ask=phone_or_email, last_asked=contact) User: “I’d rather not share that.”\n"
-        "  You: “No problem—happy to continue here. If you ever prefer email, you can reach the team at the company address in [Company contact]. "
-        "  Would you like examples of how the bot would greet customers or capture interest?”\n"
-        "\n"
-        "- (Lead hint: confirm_done)\n"
-        "  You: “All set—Nasir, we’ll call 07922229622 on Mondays between 3–7 PM (note: WhatsApp chatbot). We’ll follow up if anything changes.”\n"
-        ")"
+        "You are a classifier/planner for Corah. "
+        "Return ONLY JSON on one line with fields:\n"
+        "{kind: 'smalltalk'|'lead'|'contact'|'pricing'|'qa'|'other', "
+        " needs_retrieval: boolean, "
+        " search_query: string|null, "
+        " lead_prompt: string|null}\n"
+        "Heuristics:\n"
+        "- Use 'lead' if user asks to start/arrange a callback or provides contact.\n"
+        "- Use 'contact' for explicit company contact requests.\n"
+        "- Use 'pricing' for cost/plans.\n"
+        "- Use 'qa' for knowledge that likely needs the KB.\n"
+        "- If in doubt, set needs_retrieval=true and pass a trimmed search_query."
     )
     user = f"User text:\n{user_text}\n\nLead hint (optional): {lead_hint or 'none'}"
     raw = _chat(_PLANNER_MODEL, system, user, temperature=0.0)
 
-    # Tolerant JSON extraction
+    # Robust JSON parse
     try:
         data = json.loads(raw)
         if isinstance(data, dict):
             return data
     except Exception:
         pass
-
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if m:
         try:
@@ -163,58 +122,71 @@ def _planner(user_text: str, lead_hint: str = "") -> Dict[str, Any]:
             pass
 
     # Safe default
-    return {"kind": "qa", "needs_retrieval": True, "search_query": user_text}
+    return {"kind": "qa", "needs_retrieval": True, "search_query": user_text, "lead_prompt": None}
 
+# -----------------------------
+# Final answer composition
+# -----------------------------
 def _final_answer(
     model: str,
     user_text: str,
     retrieved_snippets: str,
+    summary_ctx: str,
     user_details: str,
     contact_ctx: str,
     pricing_ctx: str,
-    effective_hint: Optional[str],
-    last_asked: Optional[str],
+    lead_hint: str,
+    last_asked: str,
+    current_topic: str,
+    earlier_mention: str,
 ) -> str:
     """
-    Second LLM pass: compose the actual reply using retrieved evidence + facts,
-    and a compact lead hint (if any). This model WRITES ALL WORDS; no boilerplate from code.
+    Second pass: the actual user-visible reply.
+    The controller (capture.py) owns flow; we only phrase the next step.
     """
-    # Convert the hint into a small “intent” line the model can follow naturally
-    hint_text = effective_hint or "none"
-
     system = (
-        "You are Corah, Corvox’s friendly front-desk assistant—polite, extra-friendly, and genuinely helpful.\n"
-        "\n"
-        "Voice & Style: warm, human, and concise; use contractions; acknowledge the user’s intent; be encouraging. "
-        "Default to 1–3 sentences. Vary openers (don’t say the same phrase every turn). Use the user’s name once when first captured; otherwise sparingly.\n"
-        "\n"
-        "Conversation rules (follow strictly):\n"
-        "1) Ask at most ONE short question per turn—no stacked CTAs.\n"
-        "2) If there is a Lead hint, ask only the next step it specifies. "
-        "   If last_asked equals that step, do NOT repeat—briefly help/acknowledge and gently bridge back.\n"
-        "3) Use [Company contact] ONLY for Corvox details; never present values in [User details] as company info. "
-        "   If company info is missing, say so briefly.\n"
-        "4) If the user asks for their saved details (name/phone/email), read them from [User details] plainly.\n"
-        "5) Never restart or advance any lead flow on your own; phrase only the hinted next step.\n"
-        "6) If the user declines to share contact, respect it; offer alternatives and keep helping.\n"
-        "7) Avoid boilerplate; tailor replies to what was asked.\n"
+        "You are **Corah**, Corvox’s warm front-desk assistant — polite, patient, and genuinely helpful.\n"
+        "Speak naturally like a professional receptionist who enjoys helping people.\n\n"
+        "Core style (follow strictly):\n"
+        "• Friendly and concise (1–3 sentences by default). Vary openers; avoid repeating the user’s words.\n"
+        "• Ask at most ONE short question in a turn. No stacked CTAs.\n"
+        "• Respect refusals: if the user declines to share contact, keep helping and (at most once) offer the email from [Company contact] as an alternative.\n"
+        "• Use [Summary] and any [Earlier mention] to maintain continuity and resolve references.\n"
+        "• Use current_topic to stay on the same thread when the user says “tell me more / yes / go on”.\n"
+        "• Use ONLY [Company contact] for Corvox’s contact details; NEVER treat [User details] as company contact.\n"
+        "• When the user asks about their own saved details, read from [User details] plainly.\n"
+        "• Never restart or advance the lead flow yourself; obey the hint from the controller.\n"
+        "• Do not start every message with a greeting or the user’s name; use name only once when first captured and when natural.\n\n"
+        "Lead hint policy:\n"
+        "• If hint=ask_name/contact/time/notes — ask exactly one short, friendly question to gather that field.\n"
+        "• If hint=bridge_back_to_<field> — first answer the user’s message briefly, then gently steer back to that single field without repeating the exact prior wording.\n"
+        "• If hint=confirm_done — give a concise confirmation summarizing Name/Phone/Email/Preferred time and a warm sign-off (no further asks).\n"
+        "• If no hint is present — just answer helpfully using [Summary]/current_topic.\n\n"
+        "Few-shot style mini-examples (follow tone, not content):\n"
+        "1) (bridge_back_to_time) User: “What tech do you use?” → “We build on WhatsApp Business + a secure AI backend. When’s a good time for a quick call?”\n"
+        "2) (ask_contact) After name captured → “Thanks, Ayesha — what’s the best number or email to reach you?”\n"
+        "3) (confirm_done) → “All set — I’ve logged your callback for Tue 3pm. We’ll call +44 7123… Anything else before I close this chat?”\n"
     )
+
+    # Compose the user message with all sections
     user = (
         f"User: {user_text}\n\n"
+        f"[Summary]\n{summary_ctx or 'None'}\n\n"
         f"[User details]\n{user_details or 'None'}\n\n"
         f"[Company contact]\n{contact_ctx or 'None'}\n\n"
         f"[Pricing]\n{pricing_ctx or 'None'}\n\n"
-        f"[Retrieved evidence]\n{retrieved_snippets or 'None'}\n\n"
-        f"[Lead hint]\n{hint_text}\n\n"
-        f"[last_asked]\n{last_asked or 'none'}\n\n"
-        "Reply as Corah now—be specific, calm, and natural; no repetition."
+        f"[Retrieved]\n{retrieved_snippets or 'None'}\n\n"
+        f"[Lead hint]\n{lead_hint or 'None'}\n"
+        f"[last_asked]\n{last_asked or 'None'}\n"
+        f"[current_topic]\n{current_topic or 'None'}\n"
+        f"[Earlier mention]\n{earlier_mention or 'None'}\n\n"
+        "Now reply as Corah, following the rules above."
     )
     return _chat(model, system, user, temperature=_TEMPERATURE)
 
 # -----------------------------
 # Public API (called by app/api/main.py)
 # -----------------------------
-
 def generate_answer(
     question: str,
     k: int = 5,
@@ -226,34 +198,30 @@ def generate_answer(
     Two-pass LLM pipeline:
       1) Planner LLM: classify + (optional) search query rewrite
       2) Retrieval (if needed)
-      3) Final LLM: compose the answer with facts + evidence + compact hint
+      3) Final LLM: compose the answer with facts + evidence + controller hints
     """
-    # 0) Split the augmented question: user text + [Context]
+    # 0) Split augmented question: user text + our [Context] block
     user_text, ctx_block = _split_user_and_ctx(question)
 
-    # Pull structured sections from context
-    user_details = _extract_section(ctx_block, "User details")
-    contact_ctx  = _extract_section(ctx_block, "Company contact")
-    pricing_ctx  = _extract_section(ctx_block, "Pricing")
+    # Structured sections
+    summary_ctx   = _extract_section(ctx_block, "Summary")
+    user_details  = _extract_section(ctx_block, "User details")
+    contact_ctx   = _extract_section(ctx_block, "Company contact")
+    pricing_ctx   = _extract_section(ctx_block, "Pricing")
 
-    bits = _extract_ctx_bits(ctx_block)
-    lead_hint  = (bits.get("lead_hint") or "").strip() or None
-    last_asked = (bits.get("last_asked") or "").strip() or None
-
-    # If we’re being told to ask the same thing we just asked, convert to a bridge
-    effective_hint = lead_hint
-    if lead_hint and last_asked:
-        # lead_hint patterns: ask_name / ask_contact / ask_time / ask_notes / bridge_back_to_<field> / confirm_done / after_done
-        m = re.match(r"ask_(name|contact|time|notes)$", lead_hint)
-        if m and m.group(1) == last_asked:
-            effective_hint = f"bridge_back_to_{last_asked}"
+    # Inline fields (hints & helpers)
+    fields = _extract_ctx_fields(ctx_block)
+    lead_hint       = fields.get("lead_hint", "")
+    last_asked      = fields.get("last_asked", "")
+    current_topic   = fields.get("current_topic", "")
+    earlier_mention = fields.get("earlier_mention", "")
 
     # 1) Planner
-    plan = _planner(user_text, lead_hint=effective_hint or "")
+    plan = _planner(user_text, lead_hint=lead_hint)
     needs_retrieval = bool(plan.get("needs_retrieval", True))
     search_query = (plan.get("search_query") or user_text).strip()
 
-    # 2) Retrieval (only if needed)
+    # 2) Retrieval (compact snippets)
     hits: List[Dict[str, Any]] = []
     retrieved_snippets = ""
     if needs_retrieval:
@@ -273,35 +241,40 @@ def generate_answer(
                 total += len(one)
             retrieved_snippets = "\n\n".join(pieces)
         except Exception:
-            # proceed without retrieval if it fails
-            hits = []
-            retrieved_snippets = ""
+            hits, retrieved_snippets = [], ""
 
     # 3) Final LLM
     answer = _final_answer(
         model=_FINAL_MODEL,
         user_text=user_text,
         retrieved_snippets=retrieved_snippets,
+        summary_ctx=summary_ctx,
         user_details=user_details,
         contact_ctx=contact_ctx,
         pricing_ctx=pricing_ctx,
-        effective_hint=effective_hint,
+        lead_hint=lead_hint,
         last_asked=last_asked,
+        current_topic=current_topic,
+        earlier_mention=earlier_mention,
     ).strip()
 
-    # Citations (keep schema-friendly: only include fields your API schema allows)
+    # Citations: surface doc titles/URIs when asked
     citations: List[Dict[str, Any]] = []
     if show_citations and hits:
         seen = set()
         for h in hits:
-            key = (h.get("title"), h.get("chunk_no"))
+            key = (h.get("title"), h.get("source_uri"))
             if key in seen:
                 continue
             seen.add(key)
-            citations.append({
-                "title": h.get("title"),
-                "chunk_no": h.get("chunk_no"),
-            })
+            citations.append(
+                {
+                    "title": h.get("title"),
+                    "source_uri": h.get("source_uri"),
+                    "document_id": h.get("document_id"),
+                    "chunk_no": h.get("chunk_no"),
+                }
+            )
 
     dbg = None
     if debug:
@@ -309,8 +282,9 @@ def generate_answer(
             "planner": plan,
             "used_search_query": search_query if needs_retrieval else None,
             "num_hits": len(hits),
-            "effective_hint": effective_hint,
+            "lead_hint": lead_hint,
             "last_asked": last_asked,
+            "current_topic": current_topic,
         }
 
     return {"answer": answer, "citations": citations or None, "debug": dbg}

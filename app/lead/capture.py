@@ -5,9 +5,14 @@ import os
 import re
 import json
 from datetime import datetime, timezone
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Any
 
-from app.core.config import ASK_COOLDOWN_SEC
+from app.core.config import (
+    ASK_COOLDOWN_SEC_NAME,
+    ASK_COOLDOWN_SEC_CONTACT,
+    ASK_COOLDOWN_SEC_TIME,
+    ASK_COOLDOWN_SEC_NOTES,
+)
 from app.core.session_mem import (
     get_state,
     set_state,
@@ -16,22 +21,10 @@ from app.core.session_mem import (
 )
 from app.retrieval.leads import mark_stage, mark_done
 
-"""
-This module is the LEAD FLOW CONTROLLER (logic owner).
-- It never emits user-facing copy. It returns compact HINT SIGNALS that the generator will phrase.
-- Signals:
-    {"hint":"ask_name"} | {"hint":"ask_contact"} | {"hint":"ask_time"} | {"hint":"ask_notes"}
-    {"hint":"bridge_back_to_name"} | {"hint":"bridge_back_to_contact"} | {"hint":"bridge_back_to_time"}
-    {"hint":"confirm_done"} | {"hint":"after_done"}
-- Stages: name -> contact -> time -> notes -> done
-- Persist on every transition via mark_stage/mark_done.
-- Use mark_asked()/recently_asked() to avoid repeating the same ask within a cooldown.
-"""
-
-# ===== LLM fallback config (cheap + safe) =====
+# ===== LLM fallback config for name extraction (cheap, safe) =====
 _OPENAI_MODEL = os.getenv("OPENAI_EXTRACT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 # Be conservative to avoid false positives
-_NAME_LLM_MIN_CONF = float(os.getenv("NAME_LLM_MIN_CONF", "0.92"))
+_NAME_LLM_MIN_CONF = float(os.getenv("NAME_LLM_MIN_CONF", "0.90"))
 
 _client = None
 def _get_client():
@@ -55,7 +48,7 @@ NAME_RE   = re.compile(
     re.I,
 )
 
-# Expanded stop words to block interrogatives and generic phrases from looking like names
+# Expanded stop words to block interrogatives/generic phrases from looking like names
 _STOP_WORDS = {
     "hi","hello","hey","ok","okay","thanks","thank","please",
     "email","phone","number","call","start","begin","book","callme",
@@ -65,8 +58,6 @@ _STOP_WORDS = {
     "what","why","how","when","where","who","can","could","would","does","do","help","service",
 }
 
-# ----- public (used by main.py for opportunistic harvest) -----
-
 def harvest_email(text: str) -> Optional[str]:
     m = EMAIL_RE.search(text or "")
     return m.group(0) if m else None
@@ -74,44 +65,6 @@ def harvest_email(text: str) -> Optional[str]:
 def harvest_phone(text: str) -> Optional[str]:
     m = PHONE_RE.search(text or "")
     return m.group(0).strip() if m else None
-
-def harvest_name(text: str) -> Optional[str]:
-    """
-    Hybrid extraction:
-      1) Broadened regex (cued names)
-      2) Plain-name heuristic (entire message looks like a short name)
-      3) LLM fallback with confidence + validation
-    """
-    t = (text or "").strip()
-
-    # 1) Regex with cues
-    m = NAME_RE.search(t)
-    if m:
-        raw = m.group(2).strip()
-        nm = _normalize_person_name(raw)
-        if _looks_like_person_name(nm):
-            return nm
-
-    # 2) Plain-name heuristic (only letters, 1–4 tokens), and not contact-ish
-    tokens = [tok for tok in t.split() if tok]
-    if 1 <= len(tokens) <= 4 and all(re.fullmatch(r"[A-Za-z][A-Za-z\-']*", tok) for tok in tokens):
-        nm = _normalize_person_name(t)
-        if _looks_like_person_name(nm):
-            return nm
-
-    # 3) LLM fallback
-    nm, conf = _llm_extract_name(t)
-    if nm and conf >= _NAME_LLM_MIN_CONF:
-        nm = _normalize_person_name(nm)
-        if _looks_like_person_name(nm):
-            return nm
-
-    return None
-
-# ----- internals -----
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 def _normalize_person_name(raw: str) -> str:
     raw = (raw or "").strip()
@@ -207,8 +160,67 @@ def _llm_extract_name(text: str) -> Tuple[Optional[str], float]:
         pass
     return None, 0.0
 
+def harvest_name(text: str) -> Optional[str]:
+    """
+    Hybrid extraction:
+      1) Broadened regex (cued names)
+      2) Plain-name heuristic (entire message looks like a short name)
+      3) LLM fallback with confidence + validation
+    """
+    t = (text or "").strip()
+
+    # 1) Regex with cues
+    m = NAME_RE.search(t)
+    if m:
+        raw = m.group(2).strip()
+        nm = _normalize_person_name(raw)
+        if _looks_like_person_name(nm):
+            return nm
+
+    # 2) Plain-name heuristic (only letters, 1–4 tokens), and not contactish
+    tokens = [tok for tok in t.split() if tok]
+    if 1 <= len(tokens) <= 4 and all(re.fullmatch(r"[A-Za-z][A-Za-z\-']*", tok) for tok in tokens):
+        nm = _normalize_person_name(t)
+        if _looks_like_person_name(nm):
+            return nm
+
+    # 3) LLM fallback
+    nm, conf = _llm_extract_name(t)
+    if nm and conf >= _NAME_LLM_MIN_CONF:
+        nm = _normalize_person_name(nm)
+        if _looks_like_person_name(nm):
+            return nm
+
+    return None
+
+# ===== Helpers =====
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def in_progress(session_id: str) -> bool:
+    st = get_state(session_id)
+    stage = (st or {}).get("lead_stage")
+    return bool(stage and stage != "done")
+
+def start(session_id: str, kind: str = "callback") -> Dict[str, Any]:
+    """
+    Begin a lead capture flow. Stage -> 'name'
+    Also persists an initial row with stage='name'.
+    Returns a SIGNAL dict: {"hint": "ask_name"}
+    """
+    st = get_state(session_id) or {}
+    if st.get("lead_stage") == "done":
+        # already closed; don't re-open automatically
+        return {"hint": "after_done"}
+
+    set_state(session_id, lead_stage="name", lead_kind=kind, lead_started_at=_now_iso())
+    mark_stage(session_id, stage="name", source="chat")
+    # mark we asked for name now (so we don't spam repeats)
+    mark_asked(session_id, "name")
+    return {"hint": "ask_name"}
+
 # Only allow name corrections with a cue or a pure short name;
-# never on messages that include contact-ish/time hints.
+# never on messages that include contactish/time hints.
 def _maybe_update_name_from(text: str, session_id: str) -> Optional[str]:
     t = (text or "").strip()
     if not t:
@@ -236,36 +248,22 @@ def _maybe_update_name_from(text: str, session_id: str) -> Optional[str]:
         return new_name
     return None
 
-# ===== controller API =====
+def _contact_refusal(text: str) -> bool:
+    """Very light refusal detector for contact sharing."""
+    t = (text or "").lower()
+    return any(kw in t for kw in [
+        "don't want to share", "dont want to share", "not sharing", "no number", "no phone",
+        "no contact", "rather not", "prefer not", "i don't want", "i dont want",
+        "no thanks", "no thank you", "stop asking", "please stop"
+    ])
 
-def in_progress(session_id: str) -> bool:
-    st = get_state(session_id)
-    stage = (st or {}).get("lead_stage")
-    return bool(stage and stage != "done")
-
-def start(session_id: str, kind: str = "callback") -> Dict[str, str]:
-    """
-    Begin a lead capture flow. Stage -> 'name'
-    Also persists an initial row with stage='name'.
-    Returns a hint dict (no user-facing copy).
-    """
-    st = get_state(session_id) or {}
-    if st.get("lead_stage") == "done":
-        # Flow already completed for this session; do not restart.
-        return {"hint": "after_done"}
-
-    # Initialize flow
-    set_state(session_id, lead_stage="name", lead_kind=kind, lead_started_at=_now_iso())
-    mark_stage(session_id, stage="name", source="chat")
-    # one-ask-per-turn: stamp the ask when we first start
-    mark_asked(session_id, "name")
-    return {"hint": "ask_name"}
-
-def take_turn(session_id: str, text: str) -> Dict[str, str]:
+def take_turn(session_id: str, text: str) -> Dict[str, Any]:
     """
     Advance the state machine one step and persist at each transition.
-    Returns a hint dict for the LLM to phrase.
-    Stages: name -> contact -> time -> notes -> done
+    Returns a SIGNAL dict:
+      {"hint": "ask_name" | "ask_contact" | "ask_time" | "ask_notes" | "confirm_done" |
+               "bridge_back_to_name" | "bridge_back_to_contact" | "bridge_back_to_time" |
+               "after_done"}
     """
     st = get_state(session_id) or {}
     stage = st.get("lead_stage") or "name"
@@ -273,20 +271,18 @@ def take_turn(session_id: str, text: str) -> Dict[str, str]:
     if stage not in {"name", "contact", "time", "notes", "done"}:
         stage = "name"
         set_state(session_id, lead_stage="name")
-        mark_stage(session_id, stage="name", source="chat")
-        mark_asked(session_id, "name")
-        return {"hint": "ask_name"}
 
     # --- NAME ---
     if stage == "name":
         n = harvest_name(text) or st.get("name")
         if not n:
-            if recently_asked(session_id, "name", ASK_COOLDOWN_SEC):
+            # Cooldown-aware: don't repeat too soon
+            if recently_asked(session_id, "name", ASK_COOLDOWN_SEC_NAME):
                 return {"hint": "bridge_back_to_name"}
             mark_asked(session_id, "name")
             return {"hint": "ask_name"}
 
-        # Accept and move to contact
+        # commit name and move forward
         set_state(session_id, name=n, lead_stage="contact")
         mark_stage(session_id, stage="contact", name=n, source="chat")
         mark_asked(session_id, "contact")
@@ -294,7 +290,7 @@ def take_turn(session_id: str, text: str) -> Dict[str, str]:
 
     # --- CONTACT ---
     if stage == "contact":
-        # Allow “actually it’s Alex” corrections without resetting (only if the message looks like a name)
+        # Allow “actually it’s Alex” corrections without resetting,
         _maybe_update_name_from(text, session_id)
 
         em = harvest_email(text)
@@ -304,17 +300,26 @@ def take_turn(session_id: str, text: str) -> Dict[str, str]:
         if ph:
             set_state(session_id, phone=ph)
 
-        # Re-read after writes
         st_now = get_state(session_id) or {}
+        refusal = _contact_refusal(text)
+
         if not (st_now.get("email") or st_now.get("phone")):
-            if recently_asked(session_id, "contact", ASK_COOLDOWN_SEC):
+            if refusal:
+                # respect refusal: don't nag, just bridge lightly
+                return {"hint": "bridge_back_to_contact"}
+            if recently_asked(session_id, "contact", ASK_COOLDOWN_SEC_CONTACT):
                 return {"hint": "bridge_back_to_contact"}
             mark_asked(session_id, "contact")
             return {"hint": "ask_contact"}
 
-        # Got contact → ask time
+        # we have contact; advance to time
         set_state(session_id, lead_stage="time")
-        mark_stage(session_id, stage="time", email=st_now.get("email"), phone=st_now.get("phone"))
+        mark_stage(
+            session_id,
+            stage="time",
+            email=st_now.get("email"),
+            phone=st_now.get("phone"),
+        )
         mark_asked(session_id, "time")
         return {"hint": "ask_time"}
 
@@ -322,7 +327,7 @@ def take_turn(session_id: str, text: str) -> Dict[str, str]:
     if stage == "time":
         pref = (text or "").strip()
         if not pref:
-            if recently_asked(session_id, "time", ASK_COOLDOWN_SEC):
+            if recently_asked(session_id, "time", ASK_COOLDOWN_SEC_TIME):
                 return {"hint": "bridge_back_to_time"}
             mark_asked(session_id, "time")
             return {"hint": "ask_time"}
@@ -338,20 +343,20 @@ def take_turn(session_id: str, text: str) -> Dict[str, str]:
         if notes:
             set_state(session_id, notes=notes)
 
-        st_final = get_state(session_id) or {}
+        st_now = get_state(session_id) or {}
         now_iso = _now_iso()
         mark_done(
             session_id,
-            name=st_final.get("name"),
-            phone=st_final.get("phone"),
-            email=st_final.get("email"),
-            preferred_time=st_final.get("preferred_time"),
-            notes=st_final.get("notes") or notes or None,
+            name=st_now.get("name"),
+            phone=st_now.get("phone"),
+            email=st_now.get("email"),
+            preferred_time=st_now.get("preferred_time"),
+            notes=st_now.get("notes") or notes or None,
             done_at=now_iso,
         )
-        # done + one-shot close flag for UI
+        # one-shot flag so UI can close once
         set_state(session_id, lead_stage="done", lead_done_at=now_iso, lead_just_done=True)
         return {"hint": "confirm_done"}
 
-    # --- DONE ---
+    # --- DONE (follow-ups after completion) ---
     return {"hint": "after_done"}
