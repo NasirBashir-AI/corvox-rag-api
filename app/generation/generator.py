@@ -5,22 +5,19 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 from openai import OpenAI
-
 from app.core.utils import normalize_ws
 from app.retrieval.retriever import search
 from app.core.config import TEMPERATURE as CONFIG_TEMPERATURE
+
+_PLANNER_MODEL = os.getenv("OPENAI_PLANNER_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+_FINAL_MODEL   = os.getenv("OPENAI_FINAL_MODEL",   os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+_TEMPERATURE   = CONFIG_TEMPERATURE  # single source of truth
 
 _client = OpenAI()
 
 _CTX_START = "[Context]"
 _CTX_END   = "[End Context]"
-_LEAD_HINT_RE   = re.compile(r"^Lead hint:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
-_TOPIC_HINT_RE  = re.compile(r"^Topic hint:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
-_LAST_ASKED_RE  = re.compile(r"^last_asked:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
-
-_PLANNER_MODEL = os.getenv("OPENAI_PLANNER_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
-_FINAL_MODEL   = os.getenv("OPENAI_FINAL_MODEL",   os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
-_TEMPERATURE   = CONFIG_TEMPERATURE  # keep centralized
+_LEAD_HINT_RE = re.compile(r"^Lead hint:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 
 def _split_user_and_ctx(q: str) -> Tuple[str, str]:
     if _CTX_START in q and _CTX_END in q:
@@ -41,15 +38,18 @@ def _extract_section(ctx_block: str, header: str) -> str:
     text = (m.group(1) + "\n" + chunk).strip()
     return "\n".join(line.rstrip() for line in text.splitlines()).strip()
 
-def _extract_hints(ctx: str) -> Dict[str, str]:
+def _extract_ctx_sections(ctx: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
-    if not ctx: return out
-    m1 = _LEAD_HINT_RE.search(ctx)
-    m2 = _TOPIC_HINT_RE.search(ctx)
-    m3 = _LAST_ASKED_RE.search(ctx)
-    if m1: out["lead_hint"] = m1.group(1).strip()
-    if m2: out["topic_hint"] = m2.group(1).strip()
-    if m3: out["last_asked"] = m3.group(1).strip()
+    out["lead_hint"] = (_LEAD_HINT_RE.search(ctx or "") or (lambda:None)()) and _LEAD_HINT_RE.search(ctx or "").group(1).strip() if ctx else ""
+    out["summary"] = _extract_section(ctx, "Summary")
+    out["current_topic"] = _extract_section(ctx, "Current topic")
+    out["recent_turns"] = _extract_section(ctx, "Recent turns")
+    out["user_details"] = _extract_section(ctx, "User details")
+    out["company_contact"] = _extract_section(ctx, "Company contact")
+    out["pricing"] = _extract_section(ctx, "Pricing")
+    out["last_asked"] = ""
+    m = re.search(r"last_asked\s*:\s*([A-Za-z_]+)", ctx or "", re.IGNORECASE)
+    if m: out["last_asked"] = m.group(1).strip().lower()
     return out
 
 def _chat(model: str, system: str, user: str, temperature: float = _TEMPERATURE) -> str:
@@ -60,60 +60,96 @@ def _chat(model: str, system: str, user: str, temperature: float = _TEMPERATURE)
     )
     return (resp.choices[0].message.content or "").strip()
 
-# ---------- planner: tiny router that honours topic hint on ack turns ----------
-def _planner(user_text: str, topic_hint: str) -> Dict[str, Any]:
+# ---------- Planner with local backchannel fast-path ----------
+_BACKCHANNELS = {
+    "yes", "yeah", "yep", "sure", "go ahead", "please continue",
+    "tell me more", "sounds good", "okay", "ok", "alright", "cool",
+    "carry on", "continue", "yup"
+}
+
+def _looks_like_backchannel(s: str) -> bool:
+    t = (s or "").strip().lower()
+    if t in _BACKCHANNELS:
+        return True
+    for pat in (r"\btell me more\b", r"\bgo ahead\b", r"\bplease continue\b", r"\bcontinue\b", r"\bsure\b", r"\byes\b", r"\bsounds good\b"):
+        if re.search(pat, t):
+            return True
+    return False
+
+def _planner(user_text: str, lead_hint: str = "") -> Dict[str, Any]:
+    # Fast path: if the user says "yes/sure/tell me more", follow up on the current topic
+    if _looks_like_backchannel(user_text):
+        return {"kind": "follow_up_on_current_topic", "needs_retrieval": False, "search_query": None, "lead_prompt": None}
+
     system = (
-        "You are a small planner. Return ONLY JSON with keys:\n"
-        "{kind:'qa'|'lead'|'contact'|'pricing'|'smalltalk', needs_retrieval:boolean, search_query:string}\n"
-        "- If user asks to arrange/book a call or provides contact -> kind:'lead'.\n"
-        "- If user gives a generic acknowledgement like 'yes/sure/tell me more', prefer topic_hint for search.\n"
-        "- Otherwise use the user_text as the search query.\n"
+        "You are a classifier/planner for a business assistant. "
+        "Return ONLY JSON: {kind:'smalltalk'|'lead'|'contact'|'pricing'|'qa'|'other', "
+        "needs_retrieval:boolean, search_query:string|null, lead_prompt:string|null}. "
+        "Use 'lead' when user asks to start/call-back, gives phone/email, or asks how to start."
     )
-    user = f"user_text: {user_text}\n\ntopic_hint: {topic_hint or 'none'}"
+    user = f"User text:\n{user_text}\n\nLead hint (optional): {lead_hint or 'none'}"
     raw = _chat(_PLANNER_MODEL, system, user, temperature=0.0)
     try:
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            return data
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
     except Exception:
-        pass
-    # safe fallback
-    search_query = topic_hint or user_text
-    return {"kind": "qa", "needs_retrieval": True, "search_query": search_query}
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                pass
+    return {"kind": "qa", "needs_retrieval": True, "search_query": user_text, "lead_prompt": None}
 
-# ---------- final answer ----------
 def _final_answer(
+    model: str,
     user_text: str,
     retrieved_snippets: str,
     user_details: str,
     contact_ctx: str,
     pricing_ctx: str,
     lead_hint: str,
-    last_asked: str,
+    summary: str,
+    current_topic: str,
+    recent_turns: str,
+    planner_kind: str,
 ) -> str:
     system = (
         "You are Corah, Corvox’s warm front-desk assistant—polite, concise, genuinely helpful.\n"
-        "Style rules (obey strictly):\n"
-        "• 1–3 sentences by default; vary your openers (no repeated 'Hi there!').\n"
-        "• Ask at most ONE short question per turn; no stacked CTAs.\n"
-        "• If a Lead hint is present, phrase exactly the next missing step. "
-        "  If last_asked equals the same ask target, do not repeat—briefly acknowledge and gently bridge back.\n"
-        "• Use [Company contact] ONLY for Corvox info. Never claim [User details] as company contact.\n"
-        "• Respect refusals to share contact; keep helping and offer alternatives without nagging.\n"
-        "• Keep answers on the current topic; do not drift to unrelated pricing/overview unless asked.\n"
+        "Core behavior (obey strictly):\n"
+        "1) Keep answers short (1–3 sentences by default), natural, and non-repetitive; vary openers.\n"
+        "2) Ask at most ONE short question in a turn. No stacked CTAs.\n"
+        "3) Use [Summary], [Current topic], and [Recent turns] to continue the same thread; "
+        "   do NOT re-ask what the user already told you.\n"
+        "4) If a lead hint is present, ask exactly ONE next step and avoid repeating the same ask if last_asked matches.\n"
+        "5) Use [Company contact] ONLY for Corvox details. Never treat [User details] as company info.\n"
+        "6) Respect refusals (e.g., no contact info): help anyway and offer alternatives—don’t nag.\n"
+        "7) Never restart the lead flow yourself; only phrase the next step indicated.\n"
+        "\n"
+        "Few-shot examples:\n"
+        "User: yes, tell me more\n"
+        "[Summary] topic: WhatsApp chatbot for jewellery; goal: capture leads\n"
+        "Assistant: Absolutely—here’s how it would plug in: we add a WhatsApp entry point, route common questions, and push interested chats into your CRM. Would you like a quick flow outline?\n"
+        "\n"
+        "User: sure, go ahead\n"
+        "[Summary] topic: reconciliation bot for an accounting firm\n"
+        "Assistant: Great—concretely, it syncs invoices, matches payments, flags discrepancies, and posts notes back to your ledger. Want me to list the data sources we’d connect?\n"
     )
-    lead_line = f"[Lead hint]\n{lead_hint}\n" if lead_hint else ""
-    last_line = f"[last_asked]\n{last_asked}\n" if last_asked else ""
     user = (
         f"User: {user_text}\n\n"
+        f"[Summary]\n{summary or 'None'}\n\n"
+        f"[Current topic]\n{current_topic or 'None'}\n\n"
+        f"[Recent turns]\n{recent_turns or 'None'}\n\n"
         f"[User details]\n{user_details or 'None'}\n\n"
         f"[Company contact]\n{contact_ctx or 'None'}\n\n"
         f"[Pricing]\n{pricing_ctx or 'None'}\n\n"
         f"[Retrieved]\n{retrieved_snippets or 'None'}\n\n"
-        f"{lead_line}{last_line}"
+        f"[Lead hint]\n{lead_hint or 'None'}\n\n"
+        f"[Planner]\nkind={planner_kind or 'qa'}\n\n"
         "Now reply as Corah."
     )
-    return _chat(_FINAL_MODEL, system, user, temperature=_TEMPERATURE)
+    return _chat(model, system, user, temperature=_TEMPERATURE)
 
 def generate_answer(
     question: str,
@@ -123,19 +159,22 @@ def generate_answer(
     show_citations: Optional[bool] = False,
 ) -> Dict[str, Any]:
     user_text, ctx_block = _split_user_and_ctx(question)
-    sections = _extract_hints(ctx_block)
-    topic_hint  = sections.get("topic_hint", "")
-    lead_hint   = sections.get("lead_hint", "")
-    last_asked  = sections.get("last_asked", "")
+    ctx = _extract_ctx_sections(ctx_block)
 
-    # structured sections
-    user_details = _extract_section(ctx_block, "User details")
-    contact_ctx  = _extract_section(ctx_block, "Company contact")
-    pricing_ctx  = _extract_section(ctx_block, "Pricing")
+    # pull structured sections
+    summary       = ctx.get("summary","")
+    current_topic = ctx.get("current_topic","")
+    recent_turns  = ctx.get("recent_turns","")
+    user_details  = ctx.get("user_details","")
+    contact_ctx   = ctx.get("company_contact","")
+    pricing_ctx   = ctx.get("pricing","")
+    lead_hint     = ctx.get("lead_hint","")
 
-    plan = _planner(user_text, topic_hint=topic_hint)
+    # Planner (with backchannel follow-up)
+    plan = _planner(user_text, lead_hint=lead_hint)
     needs_retrieval = bool(plan.get("needs_retrieval", True))
-    search_query = (plan.get("search_query") or topic_hint or user_text).strip()
+    search_query = (plan.get("search_query") or user_text).strip()
+    planner_kind = plan.get("kind") or "qa"
 
     hits: List[Dict[str, Any]] = []
     retrieved_snippets = ""
@@ -156,13 +195,17 @@ def generate_answer(
             hits, retrieved_snippets = [], ""
 
     answer = _final_answer(
+        model=_FINAL_MODEL,
         user_text=user_text,
         retrieved_snippets=retrieved_snippets,
         user_details=user_details,
         contact_ctx=contact_ctx,
         pricing_ctx=pricing_ctx,
         lead_hint=lead_hint,
-        last_asked=last_asked,
+        summary=summary,
+        current_topic=current_topic,
+        recent_turns=recent_turns,
+        planner_kind=planner_kind,
     ).strip()
 
     citations: List[Dict[str, Any]] = []
