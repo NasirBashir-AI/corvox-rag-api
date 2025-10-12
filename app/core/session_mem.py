@@ -3,24 +3,18 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from app.core.config import DB_URL
 from app.core.utils import pg_cursor
 
 # Per-session durable JSONB state.
-# We add a few light fields for conversational memory and flow control:
-# - session_summary: rolling short summary string
-# - current_topic   : short label (e.g., "WhatsApp chatbot for jewellery")
-# - pending_offer   : text label of the last promise/offer the assistant made (to be fulfilled)
-#
-# Existing fields remain untouched for compatibility.
-
 _DEF_STATE: Dict[str, Any] = {
     "name": None,
     "phone": None,
     "email": None,
     "preferred_time": None,
+
     "lead_stage": None,          # name|contact|time|notes|done
     "lead_id": None,
     "lead_done_at": None,
@@ -29,13 +23,13 @@ _DEF_STATE: Dict[str, Any] = {
     "lead_nudge_at": None,
     "lead_nudge_count": 0,
 
-    # asked-timestamps (cooldowns) - keep if already used elsewhere
+    # asked-timestamps for cooldowns
     "asked_for_name_at": None,
     "asked_for_contact_at": None,
     "asked_for_time_at": None,
     "asked_for_notes_at": None,
 
-    # NEW light memory
+    # light memory
     "session_summary": "",
     "current_topic": "",
     "pending_offer": None,
@@ -79,7 +73,6 @@ def _merge(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def default_state() -> Dict[str, Any]:
-    # deep copy
     return json.loads(json.dumps(_DEF_STATE))
 
 
@@ -123,7 +116,7 @@ def recent_turns(session_id: str, n: int = 6) -> List[Dict[str, Any]]:
     return turns[-n:]
 
 
-# ---------- NEW: lightweight helpers for pending offer / topic / summary ----------
+# ---------- Pending offer / topic / summary ----------
 
 def get_pending_offer(session_id: str) -> Optional[str]:
     return (get_state(session_id) or {}).get("pending_offer")
@@ -134,19 +127,12 @@ def set_pending_offer(session_id: str, text: str) -> None:
 def clear_pending_offer(session_id: str) -> None:
     set_state(session_id, pending_offer=None)
 
-
 def set_current_topic(session_id: str, topic: Optional[str]) -> None:
     topic = (topic or "").strip()
-    if not topic:
-        return
-    set_state(session_id, current_topic=topic)
-
+    if topic:
+        set_state(session_id, current_topic=topic)
 
 def update_summary(session_id: str, *, intent: Optional[str] = None) -> str:
-    """
-    Keep a compact one-line summary; overwrite each turn using the latest state.
-    This is intentionally simple and robust.
-    """
     st = get_state(session_id) or {}
     topic = (st.get("current_topic") or "").strip()
     name = st.get("name") or "-"
@@ -166,11 +152,65 @@ def update_summary(session_id: str, *, intent: Optional[str] = None) -> str:
         parts.append(f"Intent: {intent}")
 
     summary = " | ".join(parts)
-    # cap length to avoid bloat
     if len(summary) > 400:
         summary = summary[:397] + "..."
     set_state(session_id, session_summary=summary)
     return summary
+
+
+# ---------- Compatibility helpers expected by capture.py ----------
+
+_ASK_FIELD_MAP = {
+    "name": "asked_for_name_at",
+    "contact": "asked_for_contact_at",   # phone or email
+    "time": "asked_for_time_at",
+    "notes": "asked_for_notes_at",
+}
+
+def _parse_iso_maybe_z(ts: Optional[str]) -> Optional[datetime]:
+    if not ts:
+        return None
+    s = ts.strip()
+    try:
+        # support both "...Z" and plain ISO
+        if s.endswith("Z"):
+            s = s[:-1]
+        return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+def mark_asked(session_id: str, field: str, ts_iso: Optional[str] = None) -> None:
+    """
+    Stamp asked_for_<field>_at with now (UTC) or provided ISO timestamp.
+    Fields: name | contact | time | notes
+    """
+    key = _ASK_FIELD_MAP.get(field)
+    if not key:
+        return
+    ts = (ts_iso or (datetime.utcnow().isoformat() + "Z"))
+    set_state(session_id, **{key: ts})
+
+def recently_asked(session_id: str, field: str, cooldown_sec: int) -> bool:
+    """
+    True if asked_for_<field>_at is within cooldown_sec.
+    """
+    key = _ASK_FIELD_MAP.get(field)
+    if not key:
+        return False
+    st = get_state(session_id)
+    ts = _parse_iso_maybe_z(st.get(key))
+    if not ts:
+        return False
+    now = datetime.now(timezone.utc)
+    return (now - ts) < timedelta(seconds=max(0, int(cooldown_sec or 0)))
+
+def bump_nudge(session_id: str, now_iso: Optional[str] = None) -> None:
+    """
+    Increment lead_nudge_count and set lead_nudge_at.
+    """
+    st = get_state(session_id)
+    count = int(st.get("lead_nudge_count") or 0) + 1
+    set_state(session_id, lead_nudge_count=count, lead_nudge_at=(now_iso or datetime.utcnow().isoformat() + "Z"))
 
 
 def reset_session(session_id: str) -> None:
