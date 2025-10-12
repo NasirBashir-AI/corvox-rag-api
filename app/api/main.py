@@ -39,7 +39,8 @@ from app.lead.capture import (
 )
 from app.core.session_mem import (
     get_state, set_state, append_turn, recent_turns,
-    update_current_topic, update_summary, search_transcript
+    get_pending_offer, set_pending_offer, clear_pending_offer,
+    set_current_topic, update_summary,
 )
 
 app = FastAPI(
@@ -91,6 +92,58 @@ def api_search(q: str = Query(..., min_length=1), k: int = Query(RETRIEVAL_TOP_K
         raise HTTPException(status_code=500, detail=f"search_failed: {type(e).__name__}: {e}")
 
 # ---------------------------
+# Tiny intent + topic helpers (surgical, non-invasive)
+# ---------------------------
+
+_AFFIRM = re.compile(r"\b(yes|yep|yeah|sure|ok|okay|go ahead|please do|tell me more|sounds good|great|let's do it)\b", re.I)
+_DECLINE = re.compile(r"\b(no|nah|nope|not now|later|don'?t|do not|skip)\b", re.I)
+
+def _is_affirm(text: str) -> bool:
+    return bool(_AFFIRM.search(text or ""))
+
+def _is_decline(text: str) -> bool:
+    return bool(_DECLINE.search(text or ""))
+
+def _looks_like_followup_request(text: str) -> bool:
+    t = (text or "").lower()
+    return any(kw in t for kw in [
+        "tell me more", "explain", "how does", "how it", "how this", "details", "more about", "what next", "what's next",
+        "how it integrates", "how integrate", "integration", "walk me through", "how would it work"
+    ])
+
+def _extract_topic(text: str) -> Optional[str]:
+    t = (text or "").lower()
+    if "whatsapp" in t and "chatbot" in t:
+        return "WhatsApp chatbot"
+    if "reconciliation" in t:
+        return "AI reconciliation"
+    if "lead" in t and "capture" in t:
+        return "Lead capture"
+    if "student" in t and "recruit" in t:
+        return "Student recruitment AI"
+    if "jewell" in t or "jewel" in t:
+        return "Jewellery retail AI"
+    if "account" in t:
+        return "Accounting automation"
+    return None
+
+# Detect if the assistant made an offer/promise that should be fulfilled on user affirmation.
+_OFFER_RE = re.compile(
+    r"(would you like (to know more|me to (explain|walk you through)|details)|"
+    r"want me to (explain|go over)|shall i (explain|detail)|"
+    r"should i (send|share) (details|information))",
+    re.I
+)
+
+def _detect_offer_tag(answer: str) -> Optional[str]:
+    if not answer:
+        return None
+    if _OFFERS := _OFFER_RE.search(answer):
+        # keep a short generic tag; we don’t need to be fancy here
+        return "promised_explanation"
+    return None
+
+# ---------------------------
 # Chat (LLM-first orchestration)
 # ---------------------------
 
@@ -109,27 +162,27 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     session_id = req.session_id
     now = datetime.now(timezone.utc)
 
-    # Record the user turn early so the LLM sees the latest message
+    # record the user turn so heuristics/LLM see the latest message
     append_turn(session_id, "user", q)
 
-    # Opportunistic enrichment: topic + quick slot harvest
-    update_current_topic(session_id, q)
-
-    state = get_state(session_id)  # durable JSONB row
+    # ----- 1) Opportunistic short-term memory (light harvest) -----
+    state = get_state(session_id)
     name  = harvest_name(q)   or state.get("name")
     phone = harvest_phone(q)  or state.get("phone")
     email = harvest_email(q)  or state.get("email")
     set_state(session_id, name=name, phone=phone, email=email)
-    update_summary(session_id)
 
-    # Guard rails for nudging/starting lead capture
-    st = get_state(session_id)
-    already_started = bool(st.get("lead_started_at"))
-    already_done    = bool(st.get("lead_done_at"))
-    nudge_at_iso    = st.get("lead_nudge_at")
-    nudge_count     = int(st.get("lead_nudge_count") or 0)
+    # Topic (very light, only when obvious)
+    topic = _extract_topic(q)
+    if topic:
+        set_current_topic(session_id, topic)
 
-    recent_nudge = False
+    # Track guards
+    already_started = bool(state.get("lead_started_at"))
+    already_done    = bool(state.get("lead_done_at"))
+    nudge_at_iso    = state.get("lead_nudge_at")
+    nudge_count     = int(state.get("lead_nudge_count") or 0)
+    recent_nudge    = False
     if nudge_at_iso:
         try:
             last_dt = datetime.fromisoformat(nudge_at_iso)
@@ -137,32 +190,45 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         except Exception:
             recent_nudge = False
 
-    # 1) Controller signal (no hardcoded copy)
-    lead_signal: Optional[dict] = None
-    if lead_in_progress(session_id):
-        # Controller advances internal stage and returns a compact hint dict
-        lead_signal = lead_turn(session_id, q)  # e.g., {"hint":"ask_contact"} or {"hint":"bridge_back_to_time"} or {"hint":"confirm_done"}
-    else:
-        # Lightweight intent trigger to START capture (CTA or contact provided)
-        ql = q.lower()
-        callback_re = r"\b(call\s*back|callback|schedule(?:\s+a)?\s+call|set\s*up(?:\s+a)?\s+call|book(?:\s+a)?\s+call|arrange(?:\s+a)?\s+call|arrange(?:\s+a)?\s*callback)\b"
-        trigger = (
-            bool(re.search(callback_re, ql))
-            or any(kw in ql for kw in ["start", "begin", "i want to start", "how do i start", "i'm ready", "let's go"])
-            or bool(phone or email)
-        )
-        can_nudge = (not already_started) and (not already_done) and (not recent_nudge) and (nudge_count < LEAD_MAX_NUDGES)
-        if trigger and can_nudge:
-            # Controller initializes stage and returns {"hint":"ask_name"} (or similar)
-            lead_signal = lead_start(session_id, kind="callback")
-            set_state(
-                session_id,
-                lead_started_at=now.isoformat(),
-                lead_nudge_at=now.isoformat(),
-                lead_nudge_count=nudge_count + 1,
-            )
+    # Update rolling summary with a simple intent label
+    intent_label = "affirm" if _is_affirm(q) else ("decline" if _is_decline(q) else ("followup" if _looks_like_followup_request(q) else "ask"))
+    summary = update_summary(session_id, intent=intent_label)
 
-    # 2) Facts for LLM (company contact + pricing)
+    # ----- 2) Controller signals (with pending-offer precedence) -----
+    hint_str: Optional[str] = None
+    pending = get_pending_offer(session_id)
+
+    if pending and (_is_affirm(q) or _looks_like_followup_request(q)):
+        # Honor the earlier offer first; pause capture asks for this turn.
+        hint_str = "resolve_pending_offer"
+    else:
+        # Normal lead flow
+        if lead_in_progress(session_id):
+            sig = lead_turn(session_id, q)  # returns dict with {"hint": "..."} in your current controller
+            if isinstance(sig, dict) and sig.get("hint"):
+                hint_str = sig["hint"]
+        else:
+            # CTA trigger
+            ql = q.lower()
+            callback_re = r"\b(call\s*back|callback|schedule(?:\s+a)?\s+call|set\s*up(?:\s+a)?\s+call|book(?:\s+a)?\s+call|arrange(?:\s+a)?\s+call|arrange(?:\s+a)?\s*callback)\b"
+            trigger = (
+                bool(re.search(callback_re, ql))
+                or any(kw in ql for kw in ["start", "begin", "i want to start", "how do i start", "i'm ready", "let's go"])
+                or bool(phone or email)
+            )
+            can_nudge = (not already_started) and (not already_done) and (not recent_nudge) and (nudge_count < LEAD_MAX_NUDGES)
+            if trigger and can_nudge:
+                sig = lead_start(session_id, kind="callback")  # controller sets stage and returns {"hint":"ask_name"}
+                if isinstance(sig, dict) and sig.get("hint"):
+                    hint_str = sig["hint"]
+                set_state(
+                    session_id,
+                    lead_started_at=now.isoformat(),
+                    lead_nudge_at=now.isoformat(),
+                    lead_nudge_count=nudge_count + 1,
+                )
+
+    # ----- 3) Facts for the LLM (contact/pricing) -----
     fact_names = ["contact_email", "contact_phone", "contact_url", "office_address",
                   "pricing_bullet", "pricing_overview"]
     facts = get_facts(fact_names) or {}
@@ -179,25 +245,21 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     if facts.get("pricing_bullet"):
         pricing_context += f"Key point: {facts['pricing_bullet']}\n"
 
-    # 3) Build augmented context for the generator
-    st = get_state(session_id)  # refresh snapshot
+    # ----- 4) Compose augmented question for the generator -----
+    # user details
+    st_now = get_state(session_id)  # re-read to include any updates above
     user_details = (
-        f"Name: {st.get('name') or '-'}\n"
-        f"Phone: {st.get('phone') or '-'}\n"
-        f"Email: {st.get('email') or '-'}\n"
-        f"Preferred time: {st.get('preferred_time') or '-'}\n"
-        f"Timezone: {st.get('timezone') or '-'}"
+        f"Name: {st_now.get('name') or '-'}\n"
+        f"Phone: {st_now.get('phone') or '-'}\n"
+        f"Email: {st_now.get('email') or '-'}\n"
+        f"Preferred time: {st_now.get('preferred_time') or '-'}"
     )
 
-    # Rolling summary helps the model recall older facts
-    session_summary = st.get("session_summary") or "-"
-
-    # Derive 'last_asked' by the newest ask timestamp across known fields
-    last_asked: Optional[str] = None
+    # asked recency (optional; if you keep it)
+    last_asked = None
     ts_map = {}
     for field in ("name", "contact", "time", "notes"):
-        key = f"asked_for_{field}_at"
-        t_iso = st.get(key)
+        t_iso = st_now.get(f"asked_for_{field}_at")
         if t_iso:
             try:
                 ts_map[field] = datetime.fromisoformat(t_iso)
@@ -206,44 +268,30 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     if ts_map:
         last_asked = max(ts_map.items(), key=lambda kv: kv[1])[0]
 
-    # Lead hint line (controller → LLM)
-    hint_str = None
-    if isinstance(lead_signal, dict) and lead_signal.get("hint"):
-        hint_str = lead_signal["hint"]
+    lead_hint_line = f"Lead hint: {hint_str}" if hint_str else ""
+    last_asked_line = f"last_asked: {last_asked}" if last_asked else ""
+    summary_block = st_now.get("session_summary") or ""
+    current_topic = st_now.get("current_topic") or ""
 
-    # Optional tiny “reference resolver”: if user refers to earlier mention, pull a snippet
-    earlier_snip = None
-    if any(p in q.lower() for p in ("as i said", "as mentioned", "earlier", "before")):
-        # naive keyword pick: grab the longest 2-3 alphabetic tokens in the question
-        toks = [t for t in re.findall(r"[A-Za-z]{4,}", q.lower())][:3]
-        if toks:
-            earlier_snip = search_transcript(session_id, toks, max_chars=280)
-
-    # Assemble the full prompt seen by the generator
-    aux_lines = []
-    if hint_str:
-        aux_lines.append(f"Lead hint: {hint_str}")
-    if last_asked:
-        aux_lines.append(f"last_asked: {last_asked}")
-    if st.get("current_topic"):
-        aux_lines.append(f"current_topic: {st.get('current_topic')}")
-    if earlier_snip:
-        aux_lines.append(f"Earlier mention: {earlier_snip}")
-
-    aux_text = ("\n".join(aux_lines) + "\n") if aux_lines else ""
+    hint_lines = ""
+    if lead_hint_line:
+        hint_lines += lead_hint_line + "\n"
+    if last_asked_line:
+        hint_lines += last_asked_line + "\n"
 
     augmented_q = (
         f"{q}\n\n"
         f"[Context]\n"
-        f"- Summary:\n{session_summary}\n"
+        f"- Summary:\n{summary_block or 'None'}\n"
+        f"- Current topic: {current_topic or '-'}\n"
         f"- User details:\n{user_details}\n"
         f"- Company contact:\n{contact_context or 'None'}\n"
         f"- Pricing:\n{pricing_context or 'None'}\n"
-        f"{aux_text}"
+        f"{hint_lines}"
         f"[End Context]\n"
     )
 
-    # 4) LLM sandwich (planner -> retrieval -> final)
+    # ----- 5) LLM sandwich (planner -> retrieval -> final) -----
     result = generate_answer(
         question=augmented_q,
         k=req.k or RETRIEVAL_TOP_K,
@@ -254,14 +302,21 @@ def api_chat(req: ChatRequest) -> ChatResponse:
 
     answer = (result.get("answer") or "").strip()
     append_turn(session_id, "assistant", answer)
-    update_summary(session_id)  # keep rolling summary current
 
-    # End the session once if controller just marked done
+    # Manage pending offer tag based on the assistant's reply
+    if hint_str == "resolve_pending_offer":
+        clear_pending_offer(session_id)
+    else:
+        offer_tag = _detect_offer_tag(answer)
+        if offer_tag:
+            set_pending_offer(session_id, offer_tag)
+
+    # One-shot session close if we JUST finished the lead
     end_session = False
-    st_after = get_state(session_id)
+    st_after = get_state(session_id) or {}
     if st_after.get("lead_just_done"):
         end_session = True
-        set_state(session_id, lead_just_done=False)  # clear one-shot flag
+        set_state(session_id, lead_just_done=False)
 
     return ChatResponse(
         answer=answer,
@@ -269,32 +324,3 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         debug=result.get("debug"),
         end_session=end_session,
     )
-
-# ---------------------------
-# (Optional) tiny classifier kept for future analytics
-# ---------------------------
-
-def classify_lead_intent(turns: List[dict]) -> dict:
-    text = " ".join(t.get("content", "") for t in turns[-4:])
-    t = text.lower()
-    explicit_cta_terms = [
-        "callback", "call back",
-        "book a call", "schedule a call", "set up a call", "arrange a call",
-        "call me", "can you call",
-        "how do i start", "let's start", "get started", "sign me up", "move forward",
-        "can we talk"
-    ]
-    buying_terms = [
-        "i like this", "sounds good", "i’m interested", "i am interested",
-        "this is good", "want this", "we want this", "we need this"
-    ]
-    contact_given = ("@" in t) or any(k in t for k in ["phone", "call me on", "+", "whatsapp"])
-    explicit_cta = any(kw in t for kw in explicit_cta_terms)
-    buying = any(kw in t for kw in buying_terms)
-    if explicit_cta:
-        return {"interest": "explicit_cta", "explicit_cta": True, "contact_given": contact_given, "confidence": 0.9}
-    if contact_given:
-        return {"interest": "buying", "explicit_cta": False, "contact_given": True, "confidence": 0.8}
-    if buying:
-        return {"interest": "buying", "explicit_cta": False, "contact_given": False, "confidence": 0.7}
-    return {"interest": "curious", "explicit_cta": False, "contact_given": False, "confidence": 0.4}

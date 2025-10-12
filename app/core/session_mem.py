@@ -2,69 +2,47 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from datetime import datetime
 
-from app.core.config import (
-    DB_URL,
-)
+from app.core.config import DB_URL
 from app.core.utils import pg_cursor
 
-# -------------------------------------------------------------------
-# State shape (JSONB) — one row per session_id
-# -------------------------------------------------------------------
-# {
-#   "name": null, "phone": null, "email": null, "preferred_time": null, "timezone": null,
-#   "lead_stage": null,        # name|contact|time|notes|done (controller-owned)
-#   "lead_kind": null,         # e.g. "callback"
-#   "lead_started_at": null,
-#   "lead_done_at": null,
-#   "lead_just_done": false,   # one-shot flag to close UI
-#   "lead_nudge_at": null,
-#   "lead_nudge_count": 0,
-#   "asked_for_name_at": null,
-#   "asked_for_contact_at": null,
-#   "asked_for_time_at": null,
-#   "asked_for_notes_at": null,
-#   "current_topic": null,     # e.g., "WhatsApp chatbot for jewellery"
-#   "intent": null,            # freeform
-#   "objections": null,        # freeform
-#   "next_step": null,         # freeform
-#   "session_summary": "",     # rolling, compact summary (human-readable)
-#   "turns": [ {"role":"user"|"assistant","content":"...","ts":"ISO8601Z"} ]  # last N turns
-# }
+# Per-session durable JSONB state.
+# We add a few light fields for conversational memory and flow control:
+# - session_summary: rolling short summary string
+# - current_topic   : short label (e.g., "WhatsApp chatbot for jewellery")
+# - pending_offer   : text label of the last promise/offer the assistant made (to be fulfilled)
+#
+# Existing fields remain untouched for compatibility.
 
 _DEF_STATE: Dict[str, Any] = {
     "name": None,
     "phone": None,
     "email": None,
     "preferred_time": None,
-    "timezone": None,
-
-    "lead_stage": None,
-    "lead_kind": None,
-    "lead_started_at": None,
+    "lead_stage": None,          # name|contact|time|notes|done
+    "lead_id": None,
     "lead_done_at": None,
+    "lead_started_at": None,
     "lead_just_done": False,
-
     "lead_nudge_at": None,
     "lead_nudge_count": 0,
 
+    # asked-timestamps (cooldowns) - keep if already used elsewhere
     "asked_for_name_at": None,
     "asked_for_contact_at": None,
     "asked_for_time_at": None,
     "asked_for_notes_at": None,
 
-    "current_topic": None,
-    "intent": None,
-    "objections": None,
-    "next_step": None,
-
+    # NEW light memory
     "session_summary": "",
+    "current_topic": "",
+    "pending_offer": None,
+
     "turns": [],
 }
 
-# Postgres DDL (schema/table-once)
 SQL_CREATE = """
 CREATE SCHEMA IF NOT EXISTS corah_store;
 
@@ -88,29 +66,22 @@ DO UPDATE SET state = EXCLUDED.state, updated_at = now();
 """
 SQL_DELETE = "DELETE FROM corah_store.sessions WHERE session_id = %(sid)s;"
 
-# -------------------------------------------------------------------
-# Low-level helpers
-# -------------------------------------------------------------------
 
 def _ensure_table() -> None:
     with pg_cursor(DB_URL) as cur:
         cur.execute(SQL_CREATE)
+
 
 def _merge(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(base)
     out.update(patch or {})
     return out
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 def default_state() -> Dict[str, Any]:
     # deep copy
     return json.loads(json.dumps(_DEF_STATE))
 
-# -------------------------------------------------------------------
-# Public: get/set state
-# -------------------------------------------------------------------
 
 def get_state(session_id: str) -> Dict[str, Any]:
     _ensure_table()
@@ -119,11 +90,11 @@ def get_state(session_id: str) -> Dict[str, Any]:
         row = cur.fetchone()
         if not row:
             return default_state()
-        val = row[0]
-        if isinstance(val, dict):
-            return _merge(default_state(), val)
-        # driver might return str
-        return _merge(default_state(), json.loads(val))
+        st = row[0]
+        if isinstance(st, dict):
+            return _merge(default_state(), st)
+        return _merge(default_state(), json.loads(st))
+
 
 def set_state(session_id: str, **kwargs) -> Dict[str, Any]:
     st = get_state(session_id)
@@ -134,153 +105,75 @@ def set_state(session_id: str, **kwargs) -> Dict[str, Any]:
         cur.execute(SQL_UPSERT, {"sid": session_id, "state": json.dumps(st)})
     return st
 
-def reset_session(session_id: str) -> None:
-    _ensure_table()
-    with pg_cursor(DB_URL) as cur:
-        cur.execute(SQL_DELETE, {"sid": session_id})
-
-# -------------------------------------------------------------------
-# Turns (short-window memory)
-# -------------------------------------------------------------------
 
 def append_turn(session_id: str, role: str, content: str, keep_last: int = 20) -> None:
     st = get_state(session_id)
     turns: List[Dict[str, Any]] = st.get("turns") or []
-    turns.append({"role": role, "content": content, "ts": _now_iso()})
+    turns.append({"role": role, "content": content, "ts": datetime.utcnow().isoformat() + "Z"})
     if len(turns) > keep_last:
         turns = turns[-keep_last:]
     st["turns"] = turns
     with pg_cursor(DB_URL) as cur:
         cur.execute(SQL_UPSERT, {"sid": session_id, "state": json.dumps(st)})
 
+
 def recent_turns(session_id: str, n: int = 6) -> List[Dict[str, Any]]:
     st = get_state(session_id)
     turns: List[Dict[str, Any]] = st.get("turns") or []
     return turns[-n:]
 
-# -------------------------------------------------------------------
-# Asked-timestamps utils (cooldowns)
-# -------------------------------------------------------------------
 
-_FIELD_TO_ASKKEY = {
-    "name": "asked_for_name_at",
-    "contact": "asked_for_contact_at",
-    "time": "asked_for_time_at",
-    "notes": "asked_for_notes_at",
-}
+# ---------- NEW: lightweight helpers for pending offer / topic / summary ----------
 
-def mark_asked(session_id: str, field: str) -> None:
-    key = _FIELD_TO_ASKKEY.get(field)
-    if not key:
-        return
-    set_state(session_id, **{key: _now_iso()})
+def get_pending_offer(session_id: str) -> Optional[str]:
+    return (get_state(session_id) or {}).get("pending_offer")
 
-def recently_asked(session_id: str, field: str, cooldown_sec: int) -> bool:
-    key = _FIELD_TO_ASKKEY.get(field)
-    if not key:
-        return False
-    st = get_state(session_id)
-    t_iso = st.get(key)
-    if not t_iso:
-        return False
-    try:
-        last = datetime.fromisoformat(t_iso)
-        return (datetime.now(timezone.utc) - last).total_seconds() < max(0, int(cooldown_sec))
-    except Exception:
-        return False
+def set_pending_offer(session_id: str, text: str) -> None:
+    set_state(session_id, pending_offer=(text or "").strip() or None)
 
-def bump_nudge(session_id: str) -> None:
-    st = get_state(session_id)
-    cnt = int(st.get("lead_nudge_count") or 0) + 1
-    set_state(session_id, lead_nudge_count=cnt, lead_nudge_at=_now_iso())
+def clear_pending_offer(session_id: str) -> None:
+    set_state(session_id, pending_offer=None)
 
-# -------------------------------------------------------------------
-# Topic + Summary (rolling, light-weight)
-# -------------------------------------------------------------------
 
-def _detect_topic_from(text: str) -> Optional[str]:
-    t = (text or "").lower()
-    # very light heuristics — extend as needed
-    if "whatsapp" in t:
-        return "WhatsApp chatbot"
-    if "chatbot" in t:
-        return "Chatbot"
-    if "pricing" in t or "cost" in t or "price" in t:
-        return "Pricing"
-    if "callback" in t or "call back" in t:
-        return "Callback request"
-    return None
-
-def update_current_topic(session_id: str, last_user_text: str) -> None:
-    topic = _detect_topic_from(last_user_text)
+def set_current_topic(session_id: str, topic: Optional[str]) -> None:
+    topic = (topic or "").strip()
     if not topic:
         return
-    st = get_state(session_id)
-    prev = st.get("current_topic")
-    if not prev or (topic.lower() not in prev.lower()):
-        set_state(session_id, current_topic=topic)
+    set_state(session_id, current_topic=topic)
 
-def _fmt(val: Optional[str]) -> str:
-    return val if val else "-"
 
-def update_summary(session_id: str) -> None:
+def update_summary(session_id: str, *, intent: Optional[str] = None) -> str:
     """
-    Build a compact rolling summary from structured slots.
-    Keep it deterministic (no LLM here) so it's cheap and stable.
+    Keep a compact one-line summary; overwrite each turn using the latest state.
+    This is intentionally simple and robust.
     """
-    st = get_state(session_id)
-    parts: List[str] = []
+    st = get_state(session_id) or {}
+    topic = (st.get("current_topic") or "").strip()
+    name = st.get("name") or "-"
+    phone = st.get("phone") or "-"
+    email = st.get("email") or "-"
+    ptime = st.get("preferred_time") or "-"
+    intent = (intent or "").strip()
 
-    # Core identity / contact
-    parts.append(f"Name={_fmt(st.get('name'))}")
-    parts.append(f"Phone={_fmt(st.get('phone'))}")
-    parts.append(f"Email={_fmt(st.get('email'))}")
-    parts.append(f"TimePref={_fmt(st.get('preferred_time'))}")
-    if st.get("timezone"):
-        parts.append(f"TZ={st['timezone']}")
-
-    # Conversation intent/topic
-    if st.get("current_topic"):
-        parts.append(f"Topic={st['current_topic']}")
-    if st.get("intent"):
-        parts.append(f"Intent={st['intent']}")
-    if st.get("objections"):
-        parts.append(f"Objections={st['objections']}")
-    if st.get("next_step"):
-        parts.append(f"Next={st['next_step']}")
-
-    # Lead stage
-    if st.get("lead_stage"):
-        parts.append(f"LeadStage={st['lead_stage']}")
+    parts = []
+    if topic:
+        parts.append(f"Topic: {topic}")
+    parts.append(f"Name: {name}")
+    parts.append(f"Phone: {phone}")
+    parts.append(f"Email: {email}")
+    parts.append(f"Preferred time: {ptime}")
+    if intent:
+        parts.append(f"Intent: {intent}")
 
     summary = " | ".join(parts)
+    # cap length to avoid bloat
+    if len(summary) > 400:
+        summary = summary[:397] + "..."
     set_state(session_id, session_summary=summary)
+    return summary
 
-# -------------------------------------------------------------------
-# Transcript search (for quick “as I said earlier” lookups)
-# -------------------------------------------------------------------
 
-def search_transcript(session_id: str, keywords: List[str], max_chars: int = 400) -> Optional[str]:
-    """
-    Tiny keyword scan over the stored turns; returns one compact snippet.
-    This is deliberately simple (fast, deterministic).
-    """
-    st = get_state(session_id)
-    turns: List[Dict[str, Any]] = st.get("turns") or []
-    if not turns or not keywords:
-        return None
-
-    keys = [k.lower() for k in keywords if k]
-    # scan from newest backward to find the most recent matching user turn
-    for t in reversed(turns):
-        if t.get("role") != "user":
-            continue
-        txt = (t.get("content") or "")
-        low = txt.lower()
-        if all(k in low for k in keys):
-            snip = txt.strip()
-            if len(snip) > max_chars:
-                snip = snip[: max_chars - 3] + "..."
-            ts = t.get("ts") or ""
-            return f"{snip}  (said earlier at {ts})"
-    return None
+def reset_session(session_id: str) -> None:
+    _ensure_table()
+    with pg_cursor(DB_URL) as cur:
+        cur.execute(SQL_DELETE, {"sid": session_id})
