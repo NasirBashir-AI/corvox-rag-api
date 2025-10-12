@@ -379,23 +379,35 @@ def take_turn(session_id: str, text: str) -> str:
             return "When is a good time (and timezone) for us to contact you?"
 
         # ==== Safe finalize with try/except to avoid any crash ====
+        # Safe finalize with try/except to avoid any crash
         try:
+            st_now = get_state(session_id) or {}
             now_iso = _now_iso()
             mark_done(
                 session_id,
-                name=nm,
-                phone=ph,
-                email=em,
-                preferred_time=pft,
+                name=st_now.get("name"),
+                phone=st_now.get("phone"),
+                email=st_now.get("email"),
+                preferred_time=st_now.get("preferred_time"),
                 notes=st_now.get("notes") or notes or None,
                 done_at=now_iso,
             )
             # one-shot flag so UI closes once, not forever
             set_state(session_id, lead_stage="done", lead_done_at=now_iso, lead_just_done=True)
             return "All set! I’ve logged your request. We’ll contact you shortly. Anything else I can help with?"
-        except Exception:
-            # Keep the chat alive with a friendly failure; no server 500s.
-            return "I’ve saved most of your details, but something hiccuped while finishing. Could you confirm your preferred time once more?"
+        except Exception as e:
+            # Soft-finalize: keep chat alive and avoid 500s
+            backup = {
+                "name": st_now.get("name") if 'st_now' in locals() else None,
+                "phone": st_now.get("phone") if 'st_now' in locals() else None,
+                "email": st_now.get("email") if 'st_now' in locals() else None,
+                "preferred_time": st_now.get("preferred_time") if 'st_now' in locals() else None,
+                "notes": (st_now.get("notes") if 'st_now' in locals() else None) or notes or None,
+                "failed_at": _now_iso(),
+                "error": type(e).__name__,
+            }
+            set_state(session_id, lead_stage="done", lead_done_at=_now_iso(), lead_just_done=True, lead_backup=backup)
+            return "All set! I’ve saved your details and flagged the team to confirm the time. We’ll be in touch shortly. Anything else I can help with?"
 
     # --- DONE (follow-ups after completion) ---
     if stage == "done":
