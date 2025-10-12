@@ -56,6 +56,29 @@ def harvest_email(text: str) -> Optional[str]:
     m = EMAIL_RE.search(text or "")
     return m.group(0) if m else None
 
+def harvest_name(text: str) -> Optional[str]:
+    """
+    Best-effort person name from free text.
+    Accepts either a cue (“my name is…”) or a clean short name by itself.
+    Returns normalized name (e.g., 'nasir' -> 'Nasir') or None.
+    """
+    if not text:
+        return None
+    t = text.strip()
+
+    # Try explicit cue first
+    m = NAME_CUE_RE.search(t)
+    candidate = (m.group(2).strip() if m else None)
+
+    # Otherwise accept a plain short name reply (e.g., "nasir")
+    if not candidate and _looks_like_person_name(t):
+        candidate = t
+
+    if not candidate:
+        return None
+
+    nm = _normalize_person_name(candidate)
+    return nm if _looks_like_person_name(nm) else None
 
 def harvest_phone(text: str) -> Optional[str]:
     m = PHONE_RE.search(text or "")
