@@ -135,6 +135,7 @@ def _final_answer(
         "User: sure, go ahead\n"
         "[Summary] topic: reconciliation bot for an accounting firm\n"
         "Assistant: Great—concretely, it syncs invoices, matches payments, flags discrepancies, and posts notes back to your ledger. Want me to list the data sources we’d connect?\n"
+        "8) Never promise to schedule, send invites, or “I’ll arrange it” unless the Lead hint is **confirm_done** AND [User details] contains a contact (phone or email) and a preferred time.\n"
     )
     user = (
         f"User: {user_text}\n\n"

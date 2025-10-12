@@ -148,35 +148,35 @@ def datetime_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def take_turn(session_id: str, text: str) -> Dict[str, str]:
+def _has_contact(st: dict) -> bool:
+    return bool((st or {}).get("phone") or (st or {}).get("email"))
+
+def take_turn(session_id: str, text: str) -> dict:
     """
-    Hints-only controller.
-    Stages: name -> contact -> time -> notes -> done
+    Pure signals:
+      {"hint":"ask_name" | "ask_contact" | "ask_time" | "ask_notes" | "confirm_done" |
+       "bridge_back_to_contact" | "bridge_back_to_time"}
     """
     st = get_state(session_id) or {}
     stage = st.get("lead_stage") or "name"
 
+    if stage not in {"name", "contact", "time", "notes", "done"}:
+        stage = "name"
+        set_state(session_id, lead_stage="name")
+
     # --- NAME ---
     if stage == "name":
-        nm = _maybe_update_name_from(text, session_id) or st.get("name")
-        if nm:
-            set_state(session_id, lead_stage="contact")
-            mark_stage(session_id, stage="contact", name=nm, source="chat")
-            # next ask = contact
-            if not recently_asked(session_id, "contact", CONTACT_COOLDOWN_SECS):
-                mark_asked(session_id, "contact")
-                return {"hint": "ask_contact"}
-            return {"hint": "bridge_back_to_contact"}
-        else:
-            # ensure we don't spam name quickly
-            if recently_asked(session_id, "name", ASK_COOLDOWN_NAME_SECS):
-                return {"hint": "bridge_back_to_name"}
-            mark_asked(session_id, "name")
+        n = harvest_name(text) or st.get("name")
+        if not n:
             return {"hint": "ask_name"}
+        set_state(session_id, name=n, lead_stage="contact")
+        mark_stage(session_id, stage="contact", name=n, source="chat")
+        return {"hint": "ask_contact"}
 
     # --- CONTACT ---
     if stage == "contact":
-        corrected = _maybe_update_name_from(text, session_id)  # harmless if not a name
+        # allow name corrections when safe (your tightened helper)
+        _maybe_update_name_from(text, session_id)
 
         em = harvest_email(text)
         ph = harvest_phone(text)
@@ -184,56 +184,58 @@ def take_turn(session_id: str, text: str) -> Dict[str, str]:
         if ph: set_state(session_id, phone=ph)
 
         st_now = get_state(session_id) or {}
-        if not (st_now.get("email") or st_now.get("phone")):
-            if recently_asked(session_id, "contact", CONTACT_COOLDOWN_SECS):
-                return {"hint": "bridge_back_to_contact"}
-            mark_asked(session_id, "contact")
+        if not _has_contact(st_now):
             return {"hint": "ask_contact"}
 
-        # we have contact; move to time
         set_state(session_id, lead_stage="time")
-        mark_stage(session_id, stage="time", phone=st_now.get("phone"), email=st_now.get("email"))
-        if recently_asked(session_id, "time", ASK_COOLDOWN_TIME_SECS):
-            return {"hint": "bridge_back_to_time"}
-        mark_asked(session_id, "time")
+        mark_stage(session_id, stage="time",
+                   email=st_now.get("email"), phone=st_now.get("phone"))
         return {"hint": "ask_time"}
 
     # --- TIME ---
     if stage == "time":
-        pref = (text or "").strip()
-        if pref:
-            set_state(session_id, preferred_time=pref, lead_stage="notes")
-            mark_stage(session_id, stage="notes", preferred_time=pref)
-            if recently_asked(session_id, "notes", ASK_COOLDOWN_NOTES_SECS):
-                return {"hint": "bridge_back_to_notes"}
-            mark_asked(session_id, "notes")
-            return {"hint": "ask_notes"}
+        # Guard: never progress if we still don't have contact
+        if not _has_contact(st):
+            return {"hint": "bridge_back_to_contact"}
 
-        if recently_asked(session_id, "time", ASK_COOLDOWN_TIME_SECS):
-            return {"hint": "bridge_back_to_time"}
-        mark_asked(session_id, "time")
-        return {"hint": "ask_time"}
+        pref = (text or "").strip()
+        if not pref:
+            return {"hint": "ask_time"}
+
+        set_state(session_id, preferred_time=pref, lead_stage="notes")
+        mark_stage(session_id, stage="notes", preferred_time=pref)
+        return {"hint": "ask_notes"}
 
     # --- NOTES ---
     if stage == "notes":
-        notes = (text or "").strip() or None
+        notes = (text or "").strip()
         if notes:
             set_state(session_id, notes=notes)
 
-        st_fin = get_state(session_id) or {}
-        done_at_iso = datetime_now_iso()
-        # persist final lead row
+        st_now = get_state(session_id) or {}
+        # Safety gates: only finalize when we truly have name + contact + time
+        if not st_now.get("name"):
+            set_state(session_id, lead_stage="name")
+            return {"hint": "ask_name"}
+        if not _has_contact(st_now):
+            set_state(session_id, lead_stage="contact")
+            return {"hint": "ask_contact"}
+        if not st_now.get("preferred_time"):
+            set_state(session_id, lead_stage="time")
+            return {"hint": "ask_time"}
+
+        now_iso = _now_iso()
         mark_done(
             session_id,
-            name=st_fin.get("name"),
-            phone=st_fin.get("phone"),
-            email=st_fin.get("email"),
-            preferred_time=st_fin.get("preferred_time"),
-            notes=st_fin.get("notes") or notes,
-            done_at=done_at_iso,
+            name=st_now.get("name"),
+            phone=st_now.get("phone"),
+            email=st_now.get("email"),
+            preferred_time=st_now.get("preferred_time"),
+            notes=st_now.get("notes") or notes or None,
+            done_at=now_iso,
         )
-        set_state(session_id, lead_stage="done", lead_done_at=done_at_iso, lead_just_done=True)
+        set_state(session_id, lead_stage="done", lead_done_at=now_iso, lead_just_done=True)
         return {"hint": "confirm_done"}
 
     # --- DONE ---
-    return {"hint": "after_done"}
+    return {"hint": "confirm_done"}
