@@ -17,6 +17,46 @@ from app.retrieval.leads import mark_stage, mark_done
 _OPENAI_MODEL = os.getenv("OPENAI_EXTRACT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 _NAME_LLM_MIN_CONF = float(os.getenv("NAME_LLM_MIN_CONF", "0.92"))
 
+# --- Opportunistic time harvester (lightweight, no external libs) ---
+
+_WEEKDAYS = [
+    "monday","tuesday","wednesday","thursday","friday","saturday","sunday"
+]
+_SPECIAL_DAYS = ["today", "tomorrow"]
+
+_TIME_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", re.IGNORECASE)
+
+def harvest_time(text: str) -> Optional[str]:
+    """
+    Extract a simple human time phrase like 'Tuesday 11am', 'tomorrow 3pm',
+    or just '11am'. Returns a short normalized string or None if not found.
+    """
+    if not text:
+        return None
+    t = text.strip().lower()
+
+    # find day token if present
+    day = None
+    for d in _SPECIAL_DAYS + _WEEKDAYS:
+        if d in t:
+            day = d
+            break
+
+    # common free-form responses
+    if "any time" in t or "anytime" in t:
+        return f"{day} anytime".strip() if day else "anytime"
+
+    m = _TIME_RE.search(t)
+    if not m:
+        return None
+
+    hour = m.group(1)
+    mins = m.group(2) or ""
+    ap   = m.group(3).lower()
+
+    time_part = f"{hour}{(':'+mins) if mins else ''}{ap}"
+    return f"{(day + ' ') if day else ''}{time_part}"
+
 # ===== Lazy OpenAI client =====
 _client = None
 def _get_client():
