@@ -2,243 +2,218 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Corah • Corvox</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Corah • Chat</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="icon" href="data:,">
   <style>
-    :root{
-      --bg:#0f141b;
-      --panel:#131a22;
-      --text:#e6edf3;
-      --muted:#9aa4af;
-      --accent:#8ab4ff;
-      --bot:#1e2631;
-      --user:#22324a;
-      --ring:#2f3b4a;
-    }
-    *{box-sizing:border-box}
-    html,body{height:100%}
-    body{
-      margin:0; background:var(--bg); color:var(--text);
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji","Segoe UI Emoji";
-      display:flex; justify-content:center; padding:24px;
-    }
-    .app{width:min(960px,95vw)}
-    header{display:flex; align-items:center; gap:16px; margin-bottom:16px}
-    .avatar{
-      width:56px; height:56px; border-radius:50%;
-      display:grid; place-items:center; background:#2a3a52; color:#cfe3ff;
-      font-weight:700;
-      border:1px solid var(--ring);
-    }
-    h1{margin:0; font-size:28px}
-    .sub{margin:2px 0 0; color:var(--muted); font-size:14px}
-    .chat{
-      background:var(--panel); border:1px solid var(--ring);
-      border-radius:14px; padding:16px; height:68vh; min-height:460px;
-      display:flex; flex-direction:column; gap:12px; overflow:auto;
-      scroll-behavior:smooth;
-    }
-    .bubble{
-      max-width:78%; padding:12px 14px; border-radius:12px;
-      box-shadow: 0 1px 0 rgba(0,0,0,.25);
-      line-height:1.35; white-space:pre-wrap; word-wrap:break-word;
-      border:1px solid var(--ring);
-    }
-    .bot{background:var(--bot)}
-    .user{background:var(--user); margin-left:auto}
-    .typing{display:inline-flex; gap:6px; align-items:center}
-    .dot{width:7px; height:7px; border-radius:50%; background:#9fb3cc; opacity:.4; animation:td 1.2s infinite}
-    .dot:nth-child(2){animation-delay:.15s}
-    .dot:nth-child(3){animation-delay:.3s}
-    @keyframes td{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-4px)}}
-
-    .composer{
-      display:flex; gap:10px; margin-top:14px;
-      background:var(--panel); border:1px solid var(--ring);
-      padding:10px; border-radius:12px;
-    }
-    input[type="text"]{
-      flex:1; background:#0f1520; color:var(--text); border:1px solid var(--ring);
-      padding:12px 12px; border-radius:10px; outline:none;
-    }
-    input::placeholder{color:#8994a1}
-    button{
-      background:var(--accent); color:#0d1220; border:0;
-      padding:12px 16px; border-radius:10px;
-      font-weight:700; cursor:pointer;
-    }
-    button[disabled]{opacity:.6; cursor:not-allowed}
+    /* mobile-safe scroll padding for the fixed input bar */
+    .chat-scroll { scroll-padding-bottom: 8rem; }
   </style>
 </head>
-<body>
-  <div class="app">
-    <header>
-      <div class="avatar">CO</div>
-      <div>
-        <h1>Corah</h1>
-        <div class="sub">Your AI assistant at Corvox</div>
+<body class="bg-slate-50 text-slate-900">
+  <div class="min-h-screen flex flex-col">
+    <!-- Header -->
+    <header class="border-b bg-white sticky top-0 z-10">
+      <div class="max-w-3xl mx-auto px-4 py-3 flex items-center justify-between">
+        <div class="flex items-center gap-3">
+          <div class="h-8 w-8 rounded-xl bg-indigo-600"></div>
+          <div>
+            <h1 class="font-semibold leading-tight">Corah</h1>
+            <p class="text-xs text-slate-500">Corvox’s friendly front-desk assistant - Owner: Nasir Bashir</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <button id="newChatBtn" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50">New chat</button>
+          <button id="copyLinkBtn" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50">Copy share link</button>
+        </div>
       </div>
     </header>
 
-    <main class="chat" id="messages"></main>
+    <!-- Chat timeline -->
+    <main id="chat" class="flex-1 max-w-3xl mx-auto w-full px-4 pt-4 pb-40 chat-scroll overflow-y-auto">
+      <!-- Assistant warm opener -->
+      <div class="flex gap-3 mb-4">
+        <div class="h-8 w-8 rounded-xl bg-indigo-600 flex-shrink-0"></div>
+        <div class="bg-white border rounded-2xl px-4 py-3 shadow-sm max-w-[85%]">
+          <p class="whitespace-pre-wrap">Hello! How can I help today?</p>
+        </div>
+      </div>
+    </main>
 
-    <form id="chat-form" class="composer" autocomplete="off">
-      <input id="chat-input" type="text" placeholder="Ask anything — or type ‘start’ to begin…" autocomplete="off" />
-      <button type="submit" id="send-btn">Send</button>
-    </form>
+    <!-- Composer -->
+    <div class="fixed bottom-0 inset-x-0 bg-white/80 backdrop-blur border-t">
+      <div class="max-w-3xl mx-auto px-4 py-3">
+        <form id="composer" class="flex items-end gap-2">
+          <textarea id="input" rows="1" placeholder="Type a message… (Shift+Enter = newline)"
+            class="flex-1 resize-none rounded-2xl border px-4 py-3 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            autocomplete="off"></textarea>
+          <button id="sendBtn" type="submit"
+            class="shrink-0 rounded-xl bg-indigo-600 text-white px-4 py-3 font-medium hover:bg-indigo-700 disabled:opacity-50">
+            Send
+          </button>
+        </form>
+        <p id="status" class="mt-2 text-xs text-slate-500"></p>
+      </div>
+    </div>
   </div>
 
   <script>
-    // ==== CONFIG ====
-    const API_BASE_URL = "http://44.208.12.236:8001";
+    // -------- Config --------
+    // Use same-origin by default. You can override with ?api=https://your-server:8000
+    const urlParams = new URLSearchParams(location.search);
+    const API_BASE = (urlParams.get('api') || 'http://ec2-44-208-12-236.compute-1.amazonaws.com:8000/api')
+    .replace(/\/+$/, '');
+	const HEALTH_URL = API_BASE + '/health';
+	const CHAT_URL = API_BASE + '/chat';
 
-    // ==== SESSION ====
-    const sessionId =
-      (typeof crypto !== "undefined" && crypto.randomUUID)
-        ? crypto.randomUUID()
-        : 'sess-' + Math.random().toString(36).slice(2) + Date.now();
+    // Keep one session per browser tab unless "New chat"
+    let sessionId = localStorage.getItem('corah_session_id');
+	if (!sessionId) {
+  	  const rand =
+    	(window.crypto && typeof window.crypto.randomUUID === 'function')
+      		? window.crypto.randomUUID().slice(0, 8)
+      		: (Date.now().toString(36) + Math.random().toString(36).slice(2, 10)).slice(0, 8);
+  	  sessionId = 'web-' + rand;
+  	  localStorage.setItem('corah_session_id', sessionId);
+	}
 
-    // ==== ELEMENTS ====
-    const messagesEl = document.getElementById('messages');
-    const form = document.getElementById('chat-form');
-    const input = document.getElementById('chat-input');
-    const sendBtn = document.getElementById('send-btn');
+    const chatEl = document.getElementById('chat');
+    const inputEl = document.getElementById('input');
+    const composerEl = document.getElementById('composer');
+    const sendBtn = document.getElementById('sendBtn');
+    const statusEl = document.getElementById('status');
+    const newChatBtn = document.getElementById('newChatBtn');
+    const copyLinkBtn = document.getElementById('copyLinkBtn');
 
-    // ==== STATE ====
-    let leadMode = false;         // true when inside lead capture
-    let blocking = false;         // prevent double submits
-    let lastLeadPrompt = null;    // remembers last prompt so we can resume
-    // Show a greeting bubble at top
-    addBubble(
-      "Welcome! I’m Corah — your AI assistant at Corvox. Ask me anything about our AI services — or say “start” and I’ll collect your details.",
-      "bot"
-    );
+    // Health ping (optional)
+    fetch(HEALTH_URL, { mode: 'cors' }).then(() => {
+      statusEl.textContent = 'Connected';
+    }).catch(() => {
+      statusEl.textContent = 'Connecting to API failed — check ?api=… or CORS.';
+    });
 
-    // ==== UI HELPERS ====
-    function addBubble(text, who='bot'){
-      const div = document.createElement('div');
-      div.className = `bubble ${who}`;
-      div.textContent = text;
-      messagesEl.appendChild(div);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
-      return div;
+    // Helpers
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    function addUserBubble(text) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'flex gap-3 mb-4 justify-end';
+      wrapper.innerHTML = `
+        <div class="bg-indigo-600 text-white rounded-2xl px-4 py-3 shadow-sm max-w-[85%]">
+          <p class="whitespace-pre-wrap"></p>
+        </div>
+        <div class="h-8 w-8 rounded-xl bg-indigo-600/10 border flex-shrink-0"></div>
+      `;
+      wrapper.querySelector('p').textContent = text;
+      chatEl.appendChild(wrapper);
+      chatEl.scrollTo({ top: chatEl.scrollHeight, behavior: 'smooth' });
     }
-    function addTyping(){
-      const div = document.createElement('div');
-      div.className = 'bubble bot';
-      div.innerHTML = `<span class="typing"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span>`;
-      messagesEl.appendChild(div);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
-      return { remove(){ div.remove(); } };
+    function addAssistantBubble(text) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'flex gap-3 mb-4';
+      wrapper.innerHTML = `
+        <div class="h-8 w-8 rounded-xl bg-indigo-600 flex-shrink-0"></div>
+        <div class="bg-white border rounded-2xl px-4 py-3 shadow-sm max-w-[85%]">
+          <p class="whitespace-pre-wrap"></p>
+        </div>
+      `;
+      wrapper.querySelector('p').textContent = text;
+      chatEl.appendChild(wrapper);
+      chatEl.scrollTo({ top: chatEl.scrollHeight, behavior: 'smooth' });
     }
-    async function postJSON(path, body){
-      const rsp = await fetch(`${API_BASE_URL}/${path}`, {
-        method:'POST',
-        headers:{'content-type':'application/json'},
-        body: JSON.stringify(body),
-        // credentials aren't needed when S3 static site -> EC2 public API
-      });
-      if(!rsp.ok){
-        const t = await rsp.text().catch(()=> '');
-        throw new Error(`HTTP ${rsp.status} ${rsp.statusText}: ${t}`);
-      }
-      return rsp.json();
-    }
-
-    // ==== QUESTION DETECTOR ====
-    function isLikelyQuestion(t){
-      const s = (t||'').trim();
-      return /[?]\s*$/.test(s) ||
-        /^(what|how|why|which|who|when|do|does|can|could|should|price|pricing|cost|services?|offer|capabilit|feature|support|integrat|deploy|host|security|compliance)/i
-        .test(s);
-    }
-
-    // ==== FLOWS ====
-    async function leadStart(){
-      const typing = addTyping();
-      try {
-        const out = await postJSON('lead/start', { session_id: sessionId });
-        typing.remove();
-        addBubble(out.reply, 'bot');
-        lastLeadPrompt = out.reply || null;
-        leadMode = !out.done;
-      } catch (e) {
-        typing.remove();
-        addBubble('Sorry — I had trouble starting the form. Please try again.', 'bot');
-        console.error(e);
+    function setTyping(on) {
+      if (on) {
+        statusEl.textContent = 'Corah is typing…';
+      } else {
+        statusEl.textContent = '';
       }
     }
+    function disableInput(on) {
+      inputEl.disabled = on;
+      sendBtn.disabled = on;
+    }
 
-    async function leadMessage(text){
-      const typing = addTyping();
+    // Submit handler
+    composerEl.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const q = inputEl.value.trim();
+      if (!q) return;
+      addUserBubble(q);
+      inputEl.value = '';
+      disableInput(true);
+      setTyping(true);
+
       try {
-        const out = await postJSON('lead/message', { session_id: sessionId, message: text });
-        typing.remove();
-        addBubble(out.reply, 'bot');
-        lastLeadPrompt = out.reply || null;
-        if (out.done) {
-          leadMode = false;
-          if (out.lead_id) {
-            addBubble('Thanks — captured everything. A human will follow up shortly. You can keep asking questions in the meantime.', 'bot');
+        const res = await fetch(CHAT_URL, {
+          method: 'POST',
+          mode: 'cors',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            session_id: sessionId,
+            question: q,
+            // You can pass optional flags if you enabled them server-side:
+            // debug: false, citations: false
+          })
+        });
+
+        if (!res.ok) {
+          const text = await res.text();
+          addAssistantBubble('Hmm, I hit a snag talking to the server. Please try again.');
+          console.error('API error', res.status, text);
+        } else {
+          const data = await res.json();
+          addAssistantBubble(data.answer || '(no reply)');
+          if (data.end_session) {
+            setTyping(false);
+            disableInput(true);
+            statusEl.textContent = 'Conversation closed. Start a new chat to continue.';
+            return;
           }
         }
-      } catch (e) {
-        typing.remove();
-        addBubble('Sorry — something went wrong. Please try again.', 'bot');
-        console.error(e);
-      }
-    }
-
-    async function chatMessage(text){
-      const typing = addTyping();
-      try {
-        const out = await postJSON('chat', {
-          session_id: sessionId,
-          question: text,
-          k: 3,
-          max_context: 2000
-        });
-        typing.remove();
-        addBubble(out.answer || 'I don’t have that information yet.', 'bot');
-      } catch (e) {
-        typing.remove();
-        addBubble('Sorry — I couldn’t get an answer just now. Please try again.', 'bot');
-        console.error(e);
-      }
-    }
-
-    // ==== ROUTER ====
-    form.addEventListener('submit', async (ev)=>{
-      ev.preventDefault();
-      if (blocking) return;
-
-      const text = input.value.trim();
-      if (!text) return;
-
-      addBubble(text, 'user');
-      input.value = '';
-      blocking = true; sendBtn.setAttribute('disabled','');
-
-      try {
-        // begin lead flow
-        if (!leadMode && /^(start|let'?s talk|let us talk)$/i.test(text)) {
-          await leadStart();
-        }
-        // in lead flow + user asks a question -> answer then resume prompt
-        else if (leadMode && isLikelyQuestion(text)) {
-          await chatMessage(text);
-          if (lastLeadPrompt) addBubble(lastLeadPrompt, 'bot');
-        }
-        // in lead flow providing info
-        else if (leadMode) {
-          await leadMessage(text);
-        }
-        // normal Q&A
-        else {
-          await chatMessage(text);
-        }
+      } catch (err) {
+        console.error(err);
+        addAssistantBubble('Network issue. Please check your connection and try again.');
       } finally {
-        blocking = false; sendBtn.removeAttribute('disabled');
+        setTyping(false);
+        disableInput(false);
+        inputEl.focus();
+      }
+    });
+
+    // Enter to send; Shift+Enter for newline
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendBtn.click();
+      }
+    });
+
+    // New chat = fresh session id + clear UI
+    newChatBtn.addEventListener('click', async () => {
+      sessionId = 'web-' + crypto.randomUUID().slice(0, 8);
+      localStorage.setItem('corah_session_id', sessionId);
+      chatEl.innerHTML = '';
+      addAssistantBubble('New chat started. How can I help?');
+      inputEl.disabled = false;
+      sendBtn.disabled = false;
+      statusEl.textContent = '';
+      inputEl.focus();
+    });
+
+    // Copy shareable link (includes your API base if set)
+    copyLinkBtn.addEventListener('click', async () => {
+      const share = location.origin + location.pathname + (API_BASE ? `?api=${encodeURIComponent(API_BASE)}` : '');
+      await navigator.clipboard.writeText(share);
+      statusEl.textContent = 'Share link copied!';
+      await sleep(1500);
+      statusEl.textContent = '';
+    });
+
+    // Quick focus shortcut
+    window.addEventListener('keydown', (e) => {
+      if (e.key === '/' && document.activeElement !== inputEl) {
+        e.preventDefault();
+        inputEl.focus();
       }
     });
   </script>

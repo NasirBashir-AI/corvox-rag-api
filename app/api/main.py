@@ -36,9 +36,9 @@ from app.lead.capture import (
     harvest_email,
     harvest_phone,
     harvest_name,
-    harvest_time,   # <-- NEW
+    harvest_time,   # opportunistic time capture
 )
-from app.core.session_mem import get_state, set_state, append_turn, recent_turns, update_summary  # ensure update_summary exists
+from app.core.session_mem import get_state, set_state, append_turn, recent_turns
 
 app = FastAPI(
     title="Corah API",
@@ -98,7 +98,7 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     LLM-first sandwich:
       1) Planner LLM (classify/route)
       2) Retrieval (if needed)
-      3) Final LLM (compose) — with controller (capture.py) owning the flow/stage via signals
+      3) Final LLM (compose) — controller (capture.py) owns flow via signals
     """
     q = (req.question or "").strip()
     if not q:
@@ -110,20 +110,20 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     # record the user turn so heuristics/LLM see the latest message
     append_turn(session_id, "user", q)
 
-    # keep rolling summary fresh (industry, goal, channel, etc.)
-    try:
-        update_summary(session_id)  # no-op if already present; safe to call every turn
-    except Exception:
-        pass
-
-    # ----- 1) Opportunistic short-term memory (light harvest) -----
+    # ----- 1) Opportunistic short-term memory (light harvests) -----
     state = get_state(session_id)  # durable JSONB row
+
     name  = harvest_name(q)   or state.get("name")
     phone = harvest_phone(q)  or state.get("phone")
     email = harvest_email(q)  or state.get("email")
-    time_str = harvest_time(q) or state.get("preferred_time")  # <-- NEW: opportunistic time capture
 
-    set_state(session_id, name=name, phone=phone, email=email, preferred_time=time_str)
+    # opportunistic time capture (e.g., "Tuesday 11am", "tomorrow 3pm")
+    ptime = state.get("preferred_time")
+    time_guess = harvest_time(q)
+    if time_guess and not ptime:
+        ptime = time_guess
+
+    set_state(session_id, name=name, phone=phone, email=email, preferred_time=ptime)
 
     # Guards
     already_started = bool(state.get("lead_started_at"))
@@ -138,24 +138,24 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         except Exception:
             recent_nudge = False
 
-    # ----- 2) Controller signals (no copy) -----
-    lead_signal = None  # next prompt text (we keep your existing pattern)
+    # ----- 2) Controller signals (no copy text—only hints) -----
+    lead_signal = None  # e.g., {"hint":"ask_contact"} | {"hint":"bridge_back_to_time"} | {"hint":"confirm_done"} | {"hint":"after_done"}
+
     if lead_in_progress(session_id):
         lead_signal = lead_turn(session_id, q)
     else:
-        # Intent trigger (richer CTA matcher)
+        # Intent trigger: CTA or user dropped contact/time directly
         ql = q.lower()
         callback_re = r"\b(call\s*back|callback|schedule(?:\s+a)?\s+call|set\s*up(?:\s+a)?\s+call|book(?:\s+a)?\s+call|arrange(?:\s+a)?\s+call|arrange(?:\s+a)?\s*callback)\b"
         trigger = (
             bool(re.search(callback_re, ql))
             or any(kw in ql for kw in ["start", "begin", "i want to start", "how do i start", "i'm ready", "let's go"])
-            or bool(phone or email)
-            or bool(harvest_time(q))  # <-- NEW: offering a time is also intent
+            or bool(phone or email or time_guess)  # treat time as a sign of intent if offered
         )
 
         can_nudge = (not already_started) and (not already_done) and (not recent_nudge) and (nudge_count < LEAD_MAX_NUDGES)
         if trigger and can_nudge:
-            signal = lead_start(session_id, kind="callback")  # returns first prompt text
+            signal = lead_start(session_id, kind="callback")  # {"hint":"ask_name"}
             lead_signal = signal
             # bump nudge budget & timestamp, and mark started
             set_state(
@@ -165,13 +165,10 @@ def api_chat(req: ChatRequest) -> ChatResponse:
                 lead_nudge_count=nudge_count + 1,
             )
 
-    # Map controller signal into a readable hint line for the generator
+    # Map controller signal to a compact hint string for the generator
     hint_str: Optional[str] = None
     if isinstance(lead_signal, dict) and lead_signal.get("hint"):
         hint_str = lead_signal["hint"]
-    elif isinstance(lead_signal, str) and lead_signal.strip():
-        # keep legacy text prompt as a hint line for the LLM to phrase naturally
-        hint_str = f"next_prompt: {lead_signal.strip()}"
 
     # ----- 3) Facts for the LLM (contact/pricing) -----
     fact_names = ["contact_email", "contact_phone", "contact_url", "office_address",
@@ -191,20 +188,20 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         pricing_context += f"Key point: {facts['pricing_bullet']}\n"
 
     # ----- 4) Compose augmented question for the generator -----
-    # IMPORTANT: re-fetch state so preferred_time updates from harvester are included
-    state = get_state(session_id)
+    # user details block (for the model to read customer data—not company contact)
     user_details = (
-        f"Name: {state.get('name') or '-'}\n"
-        f"Phone: {state.get('phone') or '-'}\n"
-        f"Email: {state.get('email') or '-'}\n"
-        f"Preferred time: {state.get('preferred_time') or '-'}"
+        f"Name: {name or '-'}\n"
+        f"Phone: {phone or '-'}\n"
+        f"Email: {email or '-'}\n"
+        f"Preferred time: {ptime or state.get('preferred_time','-')}"
     )
 
     # derive last_asked from the timestamps we keep in session (if any)
+    state_now = get_state(session_id) or {}
     last_asked: Optional[str] = None
     ts_map = {}
     for field in ("name", "contact", "time", "notes"):
-        t_iso = state.get(f"asked_for_{field}_at")
+        t_iso = state_now.get(f"asked_for_{field}_at")
         if t_iso:
             try:
                 ts_map[field] = datetime.fromisoformat(t_iso)
@@ -213,22 +210,24 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     if ts_map:
         last_asked = max(ts_map.items(), key=lambda kv: kv[1])[0]
 
-    # Session summary + topic + recent turns (assumed maintained elsewhere)
-    session_summary = state.get("session_summary") or ""
-    current_topic   = state.get("current_topic") or ""
-    recent = recent_turns(session_id, n=6)
-    recent_lines = []
-    for t in recent:
-        role = t.get("role")
-        content = (t.get("content") or "").strip()
-        if not content:
-            continue
-        # keep short snippets to avoid blowing context
-        if len(content) > 220:
-            content = content[:220] + "..."
-        recent_lines.append(f"{role}: {content}")
-    recent_block = "\n".join(recent_lines)
+    # bring summary/current_topic/recent turns (if present)
+    session_summary = (state_now.get("session_summary") or "").strip()
+    current_topic   = (state_now.get("current_topic") or "").strip()
 
+    # recent turns (last 6 for flow continuity)
+    turns = recent_turns(session_id, n=6)
+    recent_lines: List[str] = []
+    for t in turns:
+        role = t.get("role", "?")
+        content = (t.get("content","") or "").strip()
+        if not content: continue
+        # keep it shortish
+        if len(content) > 240:
+            content = content[:237] + "..."
+        recent_lines.append(f"{role}: {content}")
+    recent_block = "\n".join(recent_lines) if recent_lines else ""
+
+    # hint + last_asked lines
     hint_lines = ""
     if hint_str:
         hint_lines += f"Lead hint: {hint_str}\n"
@@ -238,12 +237,12 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     augmented_q = (
         f"{q}\n\n"
         f"[Context]\n"
-        f"- Summary:\n{session_summary or '-'}\n"
-        f"- Current topic:\n{current_topic or '-'}\n"
-        f"- Recent turns:\n{recent_block or '-'}\n"
         f"- User details:\n{user_details}\n"
         f"- Company contact:\n{contact_context or 'None'}\n"
         f"- Pricing:\n{pricing_context or 'None'}\n"
+        f"- Summary:\n{session_summary or '-'}\n"
+        f"- Current topic:\n{current_topic or '-'}\n"
+        f"- Recent turns:\n{recent_block or '-'}\n"
         f"{hint_lines}"
         f"[End Context]\n"
     )
