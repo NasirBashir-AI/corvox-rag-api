@@ -1,16 +1,16 @@
 # app/retrieval/leads.py
 from __future__ import annotations
 
-import uuid
+import json
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
-
 from app.core.utils import pg_cursor
 from app.core.config import DB_URL
 
+# We keep all lead data in structured columns (no JSON payload paths).
+# Table is created if missing; we also add a UNIQUE index on session_id so
+# we can use ON CONFLICT for clean upserts.
 
-# ---------------------------
-# DDL: structured table + safe indexes
-# ---------------------------
 DDL = """
 CREATE SCHEMA IF NOT EXISTS corah_store;
 
@@ -30,23 +30,16 @@ CREATE TABLE IF NOT EXISTS corah_store.leads (
   updated_at     TIMESTAMPTZ DEFAULT now()
 );
 
--- New columns added safely if table already existed
-ALTER TABLE corah_store.leads
-  ADD COLUMN IF NOT EXISTS lead_ref TEXT;
-
--- Unique indexes for clean upserts / lookups
+-- unique index allows ON CONFLICT(session_id)
 CREATE UNIQUE INDEX IF NOT EXISTS corah_leads_session_id_uq
   ON corah_store.leads(session_id);
-
-CREATE UNIQUE INDEX IF NOT EXISTS corah_leads_lead_ref_uq
-  ON corah_store.leads(lead_ref);
 """
 
 UPSERT = """
 INSERT INTO corah_store.leads (
-  session_id, name, phone, email, preferred_time, notes, source, stage, done, done_at, lead_ref, updated_at
+  session_id, name, phone, email, preferred_time, notes, source, stage, done, done_at, updated_at
 ) VALUES (
-  %(session_id)s, %(name)s, %(phone)s, %(email)s, %(preferred_time)s, %(notes)s, %(source)s, %(stage)s, %(done)s, %(done_at)s, %(lead_ref)s, now()
+  %(session_id)s, %(name)s, %(phone)s, %(email)s, %(preferred_time)s, %(notes)s, %(source)s, %(stage)s, %(done)s, %(done_at)s, now()
 )
 ON CONFLICT (session_id) DO UPDATE
 SET
@@ -59,7 +52,6 @@ SET
   stage          = COALESCE(EXCLUDED.stage,          corah_store.leads.stage),
   done           = COALESCE(EXCLUDED.done,           corah_store.leads.done),
   done_at        = COALESCE(EXCLUDED.done_at,        corah_store.leads.done_at),
-  lead_ref       = COALESCE(EXCLUDED.lead_ref,       corah_store.leads.lead_ref),
   updated_at     = now()
 RETURNING id;
 """
@@ -67,36 +59,16 @@ RETURNING id;
 SELECT_ONE = """
 SELECT
   id, session_id, name, phone, email, preferred_time, notes,
-  source, stage, done, done_at, lead_ref, created_at, updated_at
+  source, stage, done, done_at, created_at, updated_at
 FROM corah_store.leads
 WHERE session_id = %(session_id)s
 LIMIT 1;
 """
 
-
-# ---------------------------
-# Internals
-# ---------------------------
 def _ensure_schema() -> None:
     with pg_cursor(DB_URL) as cur:
         cur.execute(DDL)
 
-
-def _new_lead_ref() -> str:
-    return f"LEAD-{uuid.uuid4().hex[:8].upper()}"
-
-
-def _sanitize_params(d: Dict[str, Any]) -> Dict[str, Any]:
-    # convert empty strings to None so we never overwrite with ""
-    for k, v in list(d.items()):
-        if isinstance(v, str) and v.strip() == "":
-            d[k] = None
-    return d
-
-
-# ---------------------------
-# Public API
-# ---------------------------
 def save_lead(
     session_id: str,
     name: Optional[str] = None,
@@ -107,17 +79,15 @@ def save_lead(
     source: Optional[str] = "chat",
     stage: Optional[str] = None,
     done: Optional[bool] = None,
-    done_at: Optional[str] = None,   # ISO timestamp accepted
-    lead_ref: Optional[str] = None,
+    done_at: Optional[str] = None,  # ISO string is fine; DB casts to timestamptz if valid
 ) -> int:
     """
-    Upsert one row per session_id.
-    - Only non-null fields overwrite (COALESCE in UPSERT).
-    - Idempotent: safe to call multiple times per stage.
-    - Returns numeric lead id.
+    Upsert a lead row for this session_id.
+    - Only non-null fields overwrite existing values (via COALESCE in the UPSERT).
+    - Returns the lead id.
     """
     _ensure_schema()
-    params = _sanitize_params({
+    params = {
         "session_id": session_id,
         "name": name,
         "phone": phone,
@@ -128,15 +98,14 @@ def save_lead(
         "stage": stage,
         "done": done,
         "done_at": done_at,
-        "lead_ref": lead_ref,
-    })
+    }
     with pg_cursor(DB_URL) as cur:
         cur.execute(UPSERT, params)
         row = cur.fetchone()
         return int(row[0]) if row and row[0] is not None else 0
 
-
 def get_lead(session_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single lead by session_id."""
     _ensure_schema()
     with pg_cursor(DB_URL) as cur:
         cur.execute(SELECT_ONE, {"session_id": session_id})
@@ -146,32 +115,39 @@ def get_lead(session_id: str) -> Optional[Dict[str, Any]]:
         cols = [d[0] for d in cur.description]
         return dict(zip(cols, row))
 
-
 def mark_stage(session_id: str, stage: str, **kwargs: Any) -> int:
     """
-    Persist stage transition + any provided fields (non-nulls only).
-    Example: mark_stage(sid, "contact", phone=phone)
+    Convenience: set the current stage and persist any provided fields.
+    Usage: mark_stage(sid, 'contact', phone=phone)  # persists safely
     """
     return save_lead(session_id, stage=stage, **kwargs)
 
-
 def mark_done(session_id: str, **kwargs: Any) -> int:
     """
-    Mark lead as done (one-shot).
-    - Forces stage='done'
-    - Sets done=True
-    - Sets done_at (now) if not provided
-    - Assigns a lead_ref if missing
+    Mark lead as done; optionally pass final fields (notes, preferred_time, etc).
     """
-    lead = get_lead(session_id) or {}
-    lead_ref = lead.get("lead_ref") or _new_lead_ref()
-    done_at = kwargs.get("done_at")
+    # If caller didn't supply done_at, stamp now.
+    if "done_at" not in kwargs or not kwargs.get("done_at"):
+        kwargs["done_at"] = datetime.now(timezone.utc).isoformat()
+    return save_lead(session_id, done=True, **kwargs)
 
-    return save_lead(
-        session_id,
-        stage="done",
-        done=True,
-        done_at=done_at,   # generator/caller may pass an ISO; if None, UPSERT keeps existing or null
-        lead_ref=lead_ref,
-        **{k: v for k, v in kwargs.items() if k not in {"stage", "done", "lead_ref"}}
-    )
+# -------- Optional helper: append a compact JSON "report" into notes (no schema changes) --------
+
+def _append_to_notes(existing: Optional[str], addition: str) -> str:
+    existing = (existing or "").strip()
+    stamp = datetime.now(timezone.utc).isoformat()
+    block = f"\n\n---\nREPORT {stamp}\n{addition}\n"
+    return (existing + block) if existing else (f"REPORT {stamp}\n{addition}\n")
+
+def save_lead_report(session_id: str, report: Dict[str, Any]) -> int:
+    """
+    Append a compact JSON report into `notes` for this lead.
+    - No schema change: we just append a stamped 'REPORT <ISO>\n<json>' block.
+    - Returns the lead id (creates the row if missing).
+    """
+    _ensure_schema()
+    existing = get_lead(session_id)
+    prev_notes = existing.get("notes") if existing else None
+    addition = json.dumps(report, separators=(",", ":"), ensure_ascii=False)
+    new_notes = _append_to_notes(prev_notes, addition)
+    return save_lead(session_id, notes=new_notes)
