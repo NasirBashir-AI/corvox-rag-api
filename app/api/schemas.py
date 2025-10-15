@@ -1,52 +1,75 @@
-# app/api/schemas.py
 """
-API-facing Pydantic models for Corah.
+app/api/schemas.py
 
-Includes:
-- HealthResponse
-- SearchHit / SearchResponse
-- ChatRequest / ChatResponse
-
-Design notes
-- Keep models minimal and stable for the API layer.
-- Allow flexible metadata on ChatResponse via a generic dict.
+Pydantic models for Corah's API layer.
+Keep these concise and stable so clients don't break.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
-class HealthResponse(BaseModel):
-    ok: bool = Field(True, description="Service health flag")
+# ---------------------------
+# Health
+# ---------------------------
 
+class HealthResponse(BaseModel):
+    ok: bool = True
+
+
+# ---------------------------
+# Search (retrieval) models
+# ---------------------------
 
 class SearchHit(BaseModel):
-    score: float = Field(..., description="Relevance score")
-    content: str = Field(..., description="Snippet/content for the hit")
-    source: Optional[str] = Field(None, description="Source identifier (file/url/etc.)")
+    # Identifiers (may be None if not exposed by the query)
+    document_id: Optional[int] = None
+    chunk_no: Optional[int] = None
+
+    # Metadata
+    title: Optional[str] = None
+    source_uri: Optional[str] = None  # e.g., s3 path or doc slug
+
+    # Scoring
+    score: float = Field(..., description="Blended relevance score (0..1)")
+
+    # Content preview
+    content: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
+    # Use default_factory to avoid shared mutable defaults
     hits: List[SearchHit] = Field(default_factory=list)
 
 
+# ---------------------------
+# Chat (generation) models
+# ---------------------------
+
 class ChatRequest(BaseModel):
-    question: str = Field(..., description="User message")
     session_id: Optional[str] = Field(
-        None,
-        description="Session identifier; server will create one if not provided",
+        default=None,
+        description="Client session identifier for short-term memory.",
     )
+    question: str = Field(..., description="User's input text.")
+
+    # Optional knobs (all are overrides; if None, server uses defaults)
+    k: Optional[int] = Field(default=None, description="Top-k retrieval override.")
+    max_context: Optional[int] = Field(default=None, description="Max chars for assembled context.")
+    debug: Optional[bool] = Field(default=None, description="If true, include retrieval/trace in response.")
+    citations: Optional[bool] = Field(default=None, description="If true, include simple citations list.")
+
+
+class Citation(BaseModel):
+    title: Optional[str] = None
+    chunk_no: Optional[int] = None
+    source_uri: Optional[str] = None  # optional, if available
 
 
 class ChatResponse(BaseModel):
-    reply: str = Field(..., description="Assistant reply text")
-    session_id: str = Field(..., description="Current session id")
-    session_closed: bool = Field(
-        False, description="True if the session is finished and input should be disabled"
-    )
-    meta: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Auxiliary metadata (sentiment, intent_level, priority, recap flags, etc.)",
-    )
+    answer: str
+    citations: Optional[List[Citation]] = None
+    debug: Optional[Dict[str, Any]] = None
+    end_session: bool = False   # UI can close on true

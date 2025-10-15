@@ -1,116 +1,199 @@
 # app/core/session_mem.py
-"""
-Lightweight in-memory session state for Corah.
-
-Responsibilities
-- Create/ensure a session id
-- Store ephemeral per-session fields (name, email, phone, company, etc.)
-- Track last activity timestamps for inactivity handling
-- Maintain a minimal rolling summary for lead notes
-- Provide clear() to wipe state on close/timeout
-
-Notes
-- This is intentionally in-memory. For multi-instance deployments,
-  swap the backend with Redis or Postgres but keep the same function contracts.
-"""
-
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, List
+import json
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
-import threading
-import uuid
 
-# ---------------------------
-# Internal store
-# ---------------------------
+from app.core.config import DB_URL
+from app.core.utils import pg_cursor
 
-_LOCK = threading.Lock()
-_STORE: Dict[str, Dict[str, Any]] = {}
+# Per-session state in one JSONB row.
+# {
+#   "name": null, "phone": null, "email": null, "preferred_time": null,
+#   "company": null,
+#   "session_summary": "",          # rolling short summary we keep updated
+#   "current_topic": null,          # e.g., "WhatsApp chatbot for jewellery"
+#   "lead_stage": null,             # name|contact|time|notes|done
+#   "lead_started_at": null, "lead_done_at": null,
+#   "lead_nudge_at": null, "lead_nudge_count": 0,
+#   "asked_for_name_at": null, "asked_for_contact_at": null,
+#   "asked_for_email_at": null, "asked_for_phone_at": null,
+#   "asked_for_time_at": null, "asked_for_notes_at": null,
+#   "turns": [ {role, content, ts} ]
+# }
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+_DEF_STATE: Dict[str, Any] = {
+    "name": None,
+    "phone": None,
+    "email": None,
+    "preferred_time": None,
+    "company": None,
+    "session_summary": "",
+    "current_topic": None,
+    "lead_stage": None,
+    "lead_started_at": None,
+    "lead_done_at": None,
+    "lead_nudge_at": None,
+    "lead_nudge_count": 0,
+    "asked_for_name_at": None,
+    "asked_for_contact_at": None,
+    "asked_for_email_at": None,
+    "asked_for_phone_at": None,
+    "asked_for_time_at": None,
+    "asked_for_notes_at": None,
+    "turns": [],
+}
 
-# ---------------------------
-# Public API
-# ---------------------------
+SQL_CREATE = """
+CREATE SCHEMA IF NOT EXISTS corah_store;
 
-def ensure_session(session_id: Optional[str]) -> str:
-    """
-    Ensure a session exists; return the active session_id.
-    If session_id is None or unknown, create a new one.
-    """
-    global _STORE
-    if not session_id:
-        sid = str(uuid.uuid4())
-        with _LOCK:
-            _STORE[sid] = {"created_at": _now_iso(), "last_active_at": _now_iso(), "turns": []}
-        return sid
+CREATE TABLE IF NOT EXISTS corah_store.sessions (
+  session_id   TEXT PRIMARY KEY,
+  state        JSONB NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-    with _LOCK:
-        if session_id not in _STORE:
-            _STORE[session_id] = {"created_at": _now_iso(), "last_active_at": _now_iso(), "turns": []}
-    return session_id
+CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
+  ON corah_store.sessions (updated_at DESC);
+"""
+
+SQL_SELECT = "SELECT state FROM corah_store.sessions WHERE session_id = %(sid)s;"
+
+SQL_UPSERT = """
+INSERT INTO corah_store.sessions (session_id, state, created_at, updated_at)
+VALUES (%(sid)s, %(state)s::jsonb, now(), now())
+ON CONFLICT (session_id)
+DO UPDATE SET state = EXCLUDED.state, updated_at = now();
+"""
+
+SQL_DELETE = "DELETE FROM corah_store.sessions WHERE session_id = %(sid)s;"
+
+
+def _ensure_table() -> None:
+    with pg_cursor(DB_URL) as cur:
+        cur.execute(SQL_CREATE)
+
+
+def _merge(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    out.update(patch or {})
+    return out
+
+
+def default_state() -> Dict[str, Any]:
+    # deep copy
+    return json.loads(json.dumps(_DEF_STATE))
 
 
 def get_state(session_id: str) -> Dict[str, Any]:
-    """Return the session dict; empty dict if not present."""
-    with _LOCK:
-        return dict(_STORE.get(session_id, {}))
+    _ensure_table()
+    with pg_cursor(DB_URL) as cur:
+        cur.execute(SQL_SELECT, {"sid": session_id})
+        row = cur.fetchone()
+        if not row:
+            return default_state()
+        st = row[0]
+        if isinstance(st, dict):
+            return _merge(default_state(), st)
+        return _merge(default_state(), json.loads(st))
 
 
-def set_state(session_id: str, **fields: Any) -> None:
-    """Merge the provided fields into the session dict."""
-    with _LOCK:
-        st = _STORE.setdefault(session_id, {"created_at": _now_iso(), "turns": []})
-        st.update(fields)
-        # Keep a tiny rolling trail of the last user text, if provided
-        if "last_user_text" in fields and fields["last_user_text"]:
-            turns: List[Dict[str, Any]] = st.setdefault("turns", [])
-            turns.append({"role": "user", "content": fields["last_user_text"], "ts": _now_iso()})
-            # cap to last 6 to avoid growth
-            if len(turns) > 6:
-                del turns[:-6]
-        st["last_active_at"] = _now_iso()
+def set_state(session_id: str, **kwargs) -> Dict[str, Any]:
+    st = get_state(session_id)
+    for k, v in kwargs.items():
+        st[k] = v
+    _ensure_table()
+    with pg_cursor(DB_URL) as cur:
+        cur.execute(SQL_UPSERT, {"sid": session_id, "state": json.dumps(st)})
+    return st
 
 
-def touch_session(session_id: str) -> None:
-    """Update last_active_at for the session."""
-    with _LOCK:
-        st = _STORE.setdefault(session_id, {"created_at": _now_iso(), "turns": []})
-        st["last_active_at"] = _now_iso()
+def append_turn(session_id: str, role: str, content: str, keep_last: int = 30) -> None:
+    st = get_state(session_id)
+    turns: List[Dict[str, Any]] = st.get("turns") or []
+    turns.append({"role": role, "content": content, "ts": datetime.utcnow().isoformat() + "Z"})
+    if len(turns) > keep_last:
+        turns = turns[-keep_last:]
+    st["turns"] = turns
+    with pg_cursor(DB_URL) as cur:
+        cur.execute(SQL_UPSERT, {"sid": session_id, "state": json.dumps(st)})
 
 
-def summarize_session(session_id: str) -> str:
+def recent_turns(session_id: str, n: int = 6) -> List[Dict[str, Any]]:
+    st = get_state(session_id)
+    turns: List[Dict[str, Any]] = st.get("turns") or []
+    return turns[-n:]
+
+
+def reset_session(session_id: str) -> None:
+    _ensure_table()
+    with pg_cursor(DB_URL) as cur:
+        cur.execute(SQL_DELETE, {"sid": session_id})
+
+
+# ---------- ask tracking / cooldown helpers ----------
+
+def mark_asked(session_id: str, field: str) -> None:
     """
-    Produce a short, human-friendly line for lead notes.
-    Uses available fields without calling external models.
+    field ∈ {name, contact, email, phone, time, notes}
+    Stamps asked_for_<field>_at with now().
     """
-    with _LOCK:
-        st = _STORE.get(session_id, {})
-        if not st:
-            return ""
-
-        name = st.get("name") or "—"
-        company = st.get("company") or "—"
-        interest = st.get("last_interest_level") or "none"
-        priority = st.get("last_priority") or "cold"
-        # last two user turns for context
-        turns = st.get("turns") or []
-        last_bits = [t.get("content", "") for t in turns[-2:]] if turns else []
-        last_snippet = " | ".join(b for b in last_bits if b).strip()
-        if len(last_snippet) > 220:
-            last_snippet = last_snippet[:217] + "..."
-
-        summary = f"Name={name}; Company={company}; Interest={interest}; Priority={priority}"
-        if last_snippet:
-            summary += f"; Recent: {last_snippet}"
-        st["session_summary"] = summary
-        return summary
+    now_iso = datetime.now(timezone.utc).isoformat()
+    key = f"asked_for_{field}_at"
+    set_state(session_id, **{key: now_iso})
 
 
-def clear_session(session_id: str) -> None:
-    """Remove the session state entirely (called on user_end/timeout)."""
-    with _LOCK:
-        if session_id in _STORE:
-            del _STORE[session_id]
+def recently_asked(session_id: str, field: str, cooldown_sec: int) -> bool:
+    st = get_state(session_id)
+    key = f"asked_for_{field}_at"
+    iso = st.get(key)
+    if not iso:
+        return False
+    try:
+        dt = datetime.fromisoformat(iso)
+    except Exception:
+        return False
+    return (datetime.now(timezone.utc) - dt).total_seconds() < cooldown_sec
+
+
+# ---------- rolling summary (two-layer memory) ----------
+
+def _short(v: Optional[str]) -> Optional[str]:
+    if not v:
+        return None
+    s = " ".join((v or "").split())
+    return s[:140] if len(s) > 140 else s
+
+def update_summary(session_id: str) -> str:
+    """
+    Build a compact, human-usable summary string from current state.
+    We keep it short so the LLM can reliably use it to stay on topic.
+    """
+    st = get_state(session_id)
+    name = st.get("name")
+    company = st.get("company")
+    topic = st.get("current_topic")
+    phone = st.get("phone")
+    email = st.get("email")
+    when = st.get("preferred_time")
+
+    parts: List[str] = []
+    if company:
+        parts.append(f"company: {company}")
+    if topic:
+        parts.append(f"topic: {topic}")
+    if when:
+        parts.append(f"time_pref: {when}")
+    if name:
+        parts.append(f"name: {name}")
+    if phone:
+        parts.append(f"phone: {phone}")
+    if email:
+        parts.append(f"email: {email}")
+
+    summary = "; ".join(parts)
+    summary = _short(summary) or ""
+    set_state(session_id, session_summary=summary)
+    return summary
