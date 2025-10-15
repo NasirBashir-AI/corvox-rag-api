@@ -1,181 +1,82 @@
+# app/api/intents.py
 """
-app/api/intents.py
+Lightweight intent router for Corah (smalltalk & housekeeping only).
 
-Lightweight intent routing for Corah.
-- Never calls the retriever or LLM here; this module only classifies.
-- Categories: smalltalk | contact | pricing | services | other
-- If smalltalk, we also return a ready-made polite reply (no RAG needed).
+Purpose
+- Quickly handle harmless, non-business intents (greetings, thanks, pleasantries)
+  so the main chat flow can stay focused on lead handling and RAG.
+
+Contract
+- route_intent(text) -> dict | None
+  Returns a small dict with:
+    { "kind": "smalltalk", "reply": "<one-liner>" }
+  or None if the text should continue through normal flow.
+
+Notes
+- Keep this conservative; do not guess business intents here.
+- Pricing/quotes/booking should NOT be handled here (handled in main flow).
 """
 
 from __future__ import annotations
+from typing import Optional, Dict
 
-import re
-from typing import Optional, Tuple
-from app.lead.capture import harvest_email, harvest_phone, harvest_name
-from app.core.utils import normalize_ws
+def _lower(s: str) -> str:
+    return (s or "").strip().lower()
 
-# -----------------------------
-# Keyword lexicons (compact)
-# -----------------------------
+_GREET = (
+    "hi", "hello", "hey", "salaam", "assalam", "assalamu", "good morning", "good afternoon",
+    "good evening", "hiya"
+)
+_THANKS = ("thanks", "thank you", "appreciate it", "cheers", "much obliged")
+_POLITE = ("please", "that helps", "nice", "great", "awesome", "perfect", "cool")
+_HOW_ARE_YOU = ("how are you", "how’s it going", "hows it going", "how are u")
+_WHO_ARE_YOU = ("who are you", "what are you", "what is corah", "who is corah")
+_RESET = ("start over", "reset chat", "new chat")
 
-_SMALLTALK_PATTERNS = [
-    r"^\s*(hi|hello|hey|yo|hiya)\s*[!.]?\s*$",
-    r"^\s*(good\s*(morning|afternoon|evening))\s*[!.]?\s*$",
-    r"^\s*(how\s+are\s+you|how's\s+it\s+going|sup|what'?s\s+up)\s*\??\s*$",
-    r"^\s*(thanks|thank\s+you)\s*[!.]?\s*$",
-    r"^\s*(ok|okay|cool|great|nice)\s*[!.]?\s*$",
-]
+def route_intent(text: str) -> Optional[Dict[str, str]]:
+    t = _lower(text)
 
-_CONTACT_PATTERNS = [
-    re.compile(r"\bphone\s*(?:no\.?|number)\b", re.IGNORECASE),
-    re.compile(r"\bemail\s*(?:id|address)\b", re.IGNORECASE),
-    re.compile(r"\bcall\s*-?\s*back\b", re.IGNORECASE),
-    re.compile(r"\bwhere\s+(?:are\s+you\s+)?based\b", re.IGNORECASE),
-    re.compile(r"\bwhats?app\b", re.IGNORECASE),
-]
+    # Greetings
+    if any(t == g or t.startswith(g + " ") for g in _GREET):
+        return {
+            "kind": "smalltalk",
+            "reply": "Hello! I’m Corah. Tell me a bit about your business and what you’d like the chatbot to do."
+        }
 
-_CONTACT_KEYWORDS = [
-    "contact",
-    "get in touch",
-    "reach you",
-    "reach out",
-    "email",
-    "email address",
-    "email id",
-    "e-mail",
-    "phone",
-    "phone number",
-    "contact number",
-    "call",
-    "call back",
-    "callback",
-    "whatsapp",
-    "address",
-    "where are you based",
-    "where based",
-    "location",
-    "located",
-    "office",
-    "website",
-    "url"
-    # consider "site" only if you want it; it’s broad
-]
+    # How-are-you
+    if any(p in t for p in _HOW_ARE_YOU):
+        return {
+            "kind": "smalltalk",
+            "reply": "I’m here and ready to help with Corvox services and pricing. What would you like to know?"
+        }
 
-_PRICING_KEYWORDS = [
-    "price", "pricing", "cost", "fees", "rates", "plans", "how much",
-    "subscription", "quote", "estimate",  "price list", "how much is it", "per month", "budget"
-]
+    # Who-are-you
+    if any(p in t for p in _WHO_ARE_YOU):
+        return {
+            "kind": "smalltalk",
+            "reply": "I’m Corah, Corvox’s assistant. I can explain features, capture your details, and arrange a callback or proposal."
+        }
 
-_SERVICES_KEYWORDS = [
-    "services", "what do you do", "what does corvox do", "capabilities",
-    "solutions", "offerings", "products", "what you offer", "use cases", "areas you cover"
-]
+    # Thanks (do NOT end here; main flow handles the final-check logic)
+    if any(k in t for k in _THANKS):
+        return {
+            "kind": "smalltalk",
+            "reply": "You’re welcome! Is there anything else I can help with?"
+        }
 
-_LEAD_KEYWORDS = [
-    # booking / callback
-    "callback", "call back", "book a call", "schedule a call", "arrange a call",
-    "speak to someone", "talk to a human", "demo", "book a demo",
-    # conversion-y intents
-    "next step", "get started", "i want to take your services", "sign up",
-    "quote", "consultation"
-]
+    # General polite filler
+    if any(k in t for k in _POLITE):
+        return {
+            "kind": "smalltalk",
+            "reply": "Glad to help. Would you like to explore features or discuss next steps?"
+        }
 
+    # Reset/new chat hint (front-end should actually do the reset)
+    if any(k in t for k in _RESET):
+        return {
+            "kind": "smalltalk",
+            "reply": "To start fresh, click ‘Start New Chat’. Meanwhile, tell me what you’d like the chatbot to achieve."
+        }
 
-def _contact_focus(q: str) -> str:
-    """Return which contact detail the user is asking for."""
-    if re.search(r"\b(e-?mail|email)\b", q, re.IGNORECASE):
-        return "email"
-    if re.search(r"\b(phone|number|call)\b", q, re.IGNORECASE):
-        return "phone"
-    if re.search(r"\b(address|location|office|where\s+are\s+you\s+based)\b", q, re.IGNORECASE):
-        return "address"
-    if re.search(r"\b(website|site|url)\b", q, re.IGNORECASE):
-        return "url"
-    return "generic"
-
-# Precompile simple keyword regexes for speed/clarity
-def _compile_keywords(patterns):
-    """
-    Treat entries as regex fragments. For plain single words, add \b…\b.
-    Leave phrases/regex (those containing spaces or regex tokens) as-is.
-    """
-    parts = []
-    for p in patterns:
-        # If it already looks like regex (has \, (, [, ?, |, or spaces), keep as-is
-        if any(tok in p for tok in ["\\", "(", "[", "?", "|", " "]):
-            parts.append(p)
-        else:
-            # plain word -> word boundaries
-            parts.append(rf"\b{p}\b")
-    return re.compile("|".join(parts), re.IGNORECASE)
-
-
-_RE_CONTACT = _compile_keywords(_CONTACT_KEYWORDS)
-_RE_PRICING = _compile_keywords(_PRICING_KEYWORDS)
-_RE_SERVICES = _compile_keywords(_SERVICES_KEYWORDS)
-_RE_SMALLTALK = [re.compile(p, re.IGNORECASE) for p in _SMALLTALK_PATTERNS]
-_RE_LEAD = _compile_keywords(_LEAD_KEYWORDS)
-
-# -----------------------------
-# Public API
-# -----------------------------
-
-def detect_intent(text: str) -> Tuple[str, Optional[str]]:
-    q = normalize_ws(text or "")
-
-    # If the user message contains contact details, route to the structured path.
-    # This prevents the LLM branch from ever seeing phone/email and “refusing”.
-    if harvest_email(q) or harvest_phone(q):
-        return "contact", None
-
-    # If they only gave a name, treat it as “lead” so the capture flow can continue.
-    if harvest_name(q):
-        return "lead", None
-
-    # smalltalk first
-    for rx in _RE_SMALLTALK:
-        if rx.search(q):
-            return "smalltalk", smalltalk_reply(q)
-
-    # NEW: lead before generic services
-    if _RE_LEAD.search(q):
-        return "lead", None
-
-    if _RE_CONTACT.search(q):
-        return "contact", _contact_focus(q)
-    for rx in _CONTACT_PATTERNS:
-        if rx.search(q):
-            return "contact", None
-
-    if _RE_PRICING.search(q):
-        return "pricing", None
-    if _RE_SERVICES.search(q):
-        return "services", None
-
-    return "other", None
-
-def smalltalk_reply(text: str) -> str:
-    """
-    Provide a short, friendly reply for greetings/acknowledgements.
-    Keep it generic and professional; do not reference internal filenames.
-    """
-    t = text.lower().strip()
-
-    # Specific patterns
-    if re.search(r"\bhow\s+are\s+you\b", t):
-        return "I’m doing well—thanks for asking! How can I help today?"
-    if re.search(r"\bgood\s*morning\b", t):
-        return "Good morning! How can I help today?"
-    if re.search(r"\bgood\s*afternoon\b", t):
-        return "Good afternoon! What can I do for you?"
-    if re.search(r"\bgood\s*evening\b", t):
-        return "Good evening! How can I help?"
-
-    # Generic greetings / acks
-    if re.search(r"\b(hi|hello|hey|hiya|yo)\b", t):
-        return "Hi—how can I help today?"
-    if re.search(r"\b(thanks|thank\s*you)\b", t):
-        return "You’re welcome! What can I help you with?"
-
-    # Default smalltalk
-    return "Hello! How can I help today?"
+    # Otherwise let main flow handle it
+    return None

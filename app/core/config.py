@@ -10,6 +10,11 @@ Central configuration for Corah.
 from __future__ import annotations
 import os
 
+INACTIVITY_MINUTES = int(os.getenv("CORAH_INACTIVITY_MINUTES", "5"))
+ALLOW_SMALLTALK = True
+CORS_ALLOW_ORIGINS = ["*"]
+HALLUCINATION_GUARD_ON = True
+
 # ---------- helpers ----------
 def _get_bool(name: str, default: bool) -> bool:
     val = os.getenv(name)
