@@ -5,36 +5,40 @@ import json
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 
-from app.core.config import DB_URL
+from app.core.config import DB_URL, CTA_COOLDOWN_TURNS, CTA_MAX_ATTEMPTS
 from app.core.utils import pg_cursor
 
-# Per-session state in one JSONB row.
-# {
-#   "name": null, "phone": null, "email": null, "preferred_time": null,
-#   "company": null,
-#   "session_summary": "",          # rolling short summary we keep updated
-#   "current_topic": null,          # e.g., "WhatsApp chatbot for jewellery"
-#   "lead_stage": null,             # name|contact|time|notes|done
-#   "lead_started_at": null, "lead_done_at": null,
-#   "lead_nudge_at": null, "lead_nudge_count": 0,
-#   "asked_for_name_at": null, "asked_for_contact_at": null,
-#   "asked_for_email_at": null, "asked_for_phone_at": null,
-#   "asked_for_time_at": null, "asked_for_notes_at": null,
-#   "turns": [ {role, content, ts} ],
-#   # ---- Phase 2 additions ----
-#   "sentiment": null,              # positive | neutral | frustrated
-#   "intent_level": null,           # cold | warm | hot
-#   "last_asked": null,             # name|company|email|phone|time|notes
-#   "lead_backup": null,            # snapshot dict of recap before save
-#   "notes": null,                  # short internal summary (incl. sentiment/intent)
-#   "priority": null,               # hot|warm|cold (optional)
-#   "end_session": false,           # signal UI to disable input
-#   "last_user_at": null,           # ISO ts of most recent user message
-#   "inactivity_warn_at": null,     # ISO ts when warning was issued
-#   "inactivity_close_at": null     # ISO ts when auto-close happened
-# }
+"""
+Session memory is a single JSONB blob per session_id.
+We intentionally keep this schema flexible and avoid DB migrations by adding
+new keys inside `state`.
 
-# ...imports + existing code stay the same...
+State shape (illustrative; keys may be absent if never set):
+{
+  "name": null, "phone": null, "email": null, "preferred_time": null,
+  "company": null,
+  "session_summary": "",          # short rolling summary
+  "current_topic": null,          # e.g., "WhatsApp chatbot for jewellery"
+  "lead_stage": null,             # name|contact|time|notes|done
+  "lead_started_at": null, "lead_done_at": null,
+  "lead_nudge_at": null, "lead_nudge_count": 0,
+
+  # ask cooldown stamps
+  "asked_for_name_at": null, "asked_for_contact_at": null,
+  "asked_for_email_at": null, "asked_for_phone_at": null,
+  "asked_for_time_at": null, "asked_for_notes_at": null,
+
+  # turns + counters (for CTA cooldowns and behaviour guards)
+  "turns": [ {role, content, ts} ],
+  "turns_count": 0,               # incremented on every append_turn
+  "cta_attempts": 0,              # total CTA offers made
+  "cta_last_turn": 0,             # turn index at last CTA
+  "last_activity_at": null,       # ISO timestamp of last user/assistant turn
+
+  # lifecycle
+  "session_closed": false         # once true, /chat should respond with end_session
+}
+"""
 
 _DEF_STATE: Dict[str, Any] = {
     "name": None,
@@ -56,17 +60,11 @@ _DEF_STATE: Dict[str, Any] = {
     "asked_for_time_at": None,
     "asked_for_notes_at": None,
     "turns": [],
-
-    # --- NEW: counters/cta/inactivity ---
     "turns_count": 0,
     "cta_attempts": 0,
-    "cta_last_turn": -1,
-    "last_user_at": None,
-    "inactivity_warned": False,
-
-    # optional diagnostics
-    "sentiment": None,
-    "intent_level": None,
+    "cta_last_turn": 0,
+    "last_activity_at": None,
+    "session_closed": False,
 }
 
 SQL_CREATE = """
@@ -95,25 +93,23 @@ DO UPDATE SET state = EXCLUDED.state, updated_at = now();
 SQL_DELETE = "DELETE FROM corah_store.sessions WHERE session_id = %(sid)s;"
 
 
+# ---------- low-level utils ----------
+
 def _ensure_table() -> None:
     with pg_cursor(DB_URL) as cur:
         cur.execute(SQL_CREATE)
-
 
 def _merge(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(base)
     out.update(patch or {})
     return out
 
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def default_state() -> Dict[str, Any]:
     # deep copy
     return json.loads(json.dumps(_DEF_STATE))
 
+
+# ---------- CRUD ----------
 
 def get_state(session_id: str) -> Dict[str, Any]:
     _ensure_table()
@@ -127,48 +123,16 @@ def get_state(session_id: str) -> Dict[str, Any]:
             return _merge(default_state(), st)
         return _merge(default_state(), json.loads(st))
 
-
 def set_state(session_id: str, **kwargs) -> Dict[str, Any]:
     st = get_state(session_id)
     for k, v in kwargs.items():
         st[k] = v
+    # always refresh updated_at + last_activity when state mutates
+    st["last_activity_at"] = datetime.now(timezone.utc).isoformat()
     _ensure_table()
     with pg_cursor(DB_URL) as cur:
         cur.execute(SQL_UPSERT, {"sid": session_id, "state": json.dumps(st)})
     return st
-
-
-# ...keep SQL_* and helpers unchanged...
-
-def append_turn(session_id: str, role: str, content: str, keep_last: int = 30) -> None:
-    st = get_state(session_id)
-    turns: List[Dict[str, Any]] = st.get("turns") or []
-    turns.append({"role": role, "content": content, "ts": datetime.utcnow().isoformat() + "Z"})
-    if len(turns) > keep_last:
-        turns = turns[-keep_last:]
-    # NEW: increment turns_count each time we add a turn
-    turns_count = int(st.get("turns_count") or 0) + 1
-    st["turns"] = turns
-    st["turns_count"] = turns_count
-    with pg_cursor(DB_URL) as cur:
-        cur.execute(SQL_UPSERT, {"sid": session_id, "state": json.dumps(st)})
-
-# Optional tiny helpers (used by cooldown logic; safe to keep even if unused)
-def get_turns_count(session_id: str) -> int:
-    return int(get_state(session_id).get("turns_count") or 0)
-
-def bump_cta(session_id: str, turn_idx: int) -> None:
-    st = get_state(session_id)
-    set_state(session_id,
-        cta_attempts=int(st.get("cta_attempts") or 0) + 1,
-        cta_last_turn=int(turn_idx),
-    )
-
-def recent_turns(session_id: str, n: int = 6) -> List[Dict[str, Any]]:
-    st = get_state(session_id)
-    turns: List[Dict[str, Any]] = st.get("turns") or []
-    return turns[-n:]
-
 
 def reset_session(session_id: str) -> None:
     _ensure_table()
@@ -176,21 +140,68 @@ def reset_session(session_id: str) -> None:
         cur.execute(SQL_DELETE, {"sid": session_id})
 
 
+# ---------- turns ----------
+
+def append_turn(session_id: str, role: str, content: str, keep_last: int = 30) -> None:
+    st = get_state(session_id)
+    turns: List[Dict[str, Any]] = st.get("turns") or []
+    turns.append({"role": role, "content": content, "ts": datetime.utcnow().isoformat() + "Z"})
+    if len(turns) > keep_last:
+        turns = turns[-keep_last:]
+    # counters
+    turns_count = int(st.get("turns_count") or 0) + 1
+    st["turns"] = turns
+    st["turns_count"] = turns_count
+    st["last_activity_at"] = datetime.now(timezone.utc).isoformat()
+    with pg_cursor(DB_URL) as cur:
+        cur.execute(SQL_UPSERT, {"sid": session_id, "state": json.dumps(st)})
+
+def recent_turns(session_id: str, n: int = 6) -> List[Dict[str, Any]]:
+    st = get_state(session_id)
+    turns: List[Dict[str, Any]] = st.get("turns") or []
+    return turns[-n:]
+
+def get_turns_count(session_id: str) -> int:
+    st = get_state(session_id)
+    return int(st.get("turns_count") or 0)
+
+
+# ---------- CTA helpers (cooldown + attempts) ----------
+
+def can_offer_cta(session_id: str) -> bool:
+    """
+    True if we are allowed to make another CTA (e.g., 'Shall I arrange a discovery call?').
+    Enforces:
+      - at least CTA_COOLDOWN_TURNS turns since last CTA
+      - CTA_MAX_ATTEMPTS total cap
+    """
+    st = get_state(session_id)
+    attempts = int(st.get("cta_attempts") or 0)
+    last_turn = int(st.get("cta_last_turn") or 0)
+    turn_idx  = int(st.get("turns_count") or 0)
+    if attempts >= CTA_MAX_ATTEMPTS:
+        return False
+    if (turn_idx - last_turn) < CTA_COOLDOWN_TURNS:
+        return False
+    return True
+
+def note_cta_attempt(session_id: str) -> None:
+    st = get_state(session_id)
+    attempts = int(st.get("cta_attempts") or 0) + 1
+    turn_idx  = int(st.get("turns_count") or 0)
+    set_state(session_id, cta_attempts=attempts, cta_last_turn=turn_idx)
+
+
 # ---------- ask tracking / cooldown helpers ----------
 
 def mark_asked(session_id: str, field: str) -> None:
     """
-    field ∈ {name, contact, email, phone, time, notes, company}
-    Stamps asked_for_<field>_at with now() and sets last_asked.
+    field ∈ {name, contact, email, phone, time, notes}
+    Stamps asked_for_<field>_at with now().
     """
-    now_iso = _now_iso()
+    now_iso = datetime.now(timezone.utc).isoformat()
     key = f"asked_for_{field}_at"
-    st = get_state(session_id)
-    st[key] = now_iso
-    st["last_asked"] = field
-    with pg_cursor(DB_URL) as cur:
-        cur.execute(SQL_UPSERT, {"sid": session_id, "state": json.dumps(st)})
-
+    set_state(session_id, **{key: now_iso})
 
 def recently_asked(session_id: str, field: str, cooldown_sec: int) -> bool:
     st = get_state(session_id)
@@ -246,68 +257,11 @@ def update_summary(session_id: str) -> str:
     return summary
 
 
-# ---------- Phase 2 helpers (slots, signals, recap/backup, closure) ----------
+# ---------- lifecycle ----------
 
-SLOT_KEYS = ("name", "company", "email", "phone", "preferred_time")
+def set_session_closed(session_id: str, closed: bool = True) -> None:
+    set_state(session_id, session_closed=closed)
 
-def get_slots(session_id: str) -> Dict[str, Optional[str]]:
+def is_session_closed(session_id: str) -> bool:
     st = get_state(session_id)
-    return {k: st.get(k) for k in SLOT_KEYS}
-
-def set_slots(session_id: str, **slots) -> Dict[str, Any]:
-    """
-    Safe slot update (e.g., name/company/email/phone/preferred_time).
-    """
-    allowed = {k: v for k, v in slots.items() if k in SLOT_KEYS}
-    return set_state(session_id, **allowed)
-
-def apply_corrections(session_id: str, **slots) -> Dict[str, Any]:
-    """
-    Accept user corrections (e.g., name/email edits) and persist immediately.
-    """
-    st = set_slots(session_id, **slots)
-    update_summary(session_id)
-    return st
-
-def set_signals(session_id: str, sentiment: Optional[str] = None, intent_level: Optional[str] = None,
-                priority: Optional[str] = None) -> Dict[str, Any]:
-    st = get_state(session_id)
-    if sentiment is not None:
-        st["sentiment"] = sentiment
-    if intent_level is not None:
-        st["intent_level"] = intent_level
-    if priority is not None:
-        st["priority"] = priority
-    with pg_cursor(DB_URL) as cur:
-        cur.execute(SQL_UPSERT, {"sid": session_id, "state": json.dumps(st)})
-    return st
-
-def set_current_topic(session_id: str, topic: Optional[str]) -> Dict[str, Any]:
-    return set_state(session_id, current_topic=topic)
-
-def set_lead_backup(session_id: str, backup: Any) -> Dict[str, Any]:
-    return set_state(session_id, lead_backup=backup)
-
-def set_notes(session_id: str, notes: Optional[str]) -> Dict[str, Any]:
-    return set_state(session_id, notes=notes)
-
-def mark_lead_started(session_id: str) -> Dict[str, Any]:
-    return set_state(session_id, lead_stage="started", lead_started_at=_now_iso())
-
-def mark_lead_done(session_id: str) -> Dict[str, Any]:
-    return set_state(session_id, lead_stage="done", lead_done_at=_now_iso())
-
-def mark_end_session(session_id: str, value: bool = True) -> Dict[str, Any]:
-    return set_state(session_id, end_session=value)
-
-def record_user_activity(session_id: str) -> Dict[str, Any]:
-    """
-    Update last_user_at to now (call on each user turn if you want strict inactivity tracking).
-    """
-    return set_state(session_id, last_user_at=_now_iso())
-
-def mark_inactivity_warn(session_id: str) -> Dict[str, Any]:
-    return set_state(session_id, inactivity_warn_at=_now_iso())
-
-def mark_inactivity_close(session_id: str) -> Dict[str, Any]:
-    return set_state(session_id, inactivity_close_at=_now_iso(), end_session=True)
+    return bool(st.get("session_closed"))

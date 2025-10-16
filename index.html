@@ -20,7 +20,7 @@
           <div class="h-8 w-8 rounded-xl bg-indigo-600"></div>
           <div>
             <h1 class="font-semibold leading-tight">Corah</h1>
-            <p class="text-xs text-slate-500">Corvox’s friendly front-desk assistant - Owner: Nasir Bashir</p>
+            <p class="text-xs text-slate-500">Corvox’s friendly front-desk assistant - Owner: NB Brora</p>
           </div>
         </div>
         <div class="flex items-center gap-2">
@@ -61,41 +61,36 @@
 
   <script>
     // -------- Config --------
-    // Use same-origin by default. You can override with ?api=https://your-server:8000
     const urlParams = new URLSearchParams(location.search);
-    const API_BASE = (urlParams.get('api') || 'http://ec2-44-208-12-236.compute-1.amazonaws.com:8000/api').replace(/\/+$/, '');
-    const HEALTH_URL = API_BASE + '/health';
-    const CHAT_URL = API_BASE + '/chat';
-    const PING_URL = API_BASE + '/ping';
+    const API_BASE  = (urlParams.get('api') || 'http://ec2-44-208-12-236.compute-1.amazonaws.com:8000/api').replace(/\/+$/, '');
+    const HEALTH_URL= API_BASE + '/health';
+    const CHAT_URL  = API_BASE + '/chat';
+    const PING_URL  = API_BASE + '/ping';
 
-    // Inactivity knobs (mirror server; warn ~1 minute before close)
+    // Inactivity knobs (frontend hint; backend is source of truth)
     const INACTIVITY_MINUTES = 5;
     const FRONTEND_WARN_AT_MIN = Math.max(1, INACTIVITY_MINUTES - 1);
 
     // Keep one session per browser tab unless "New chat"
     let sessionId = localStorage.getItem('corah_session_id');
     if (!sessionId) {
-      const rand = (window.crypto && typeof window.crypto.randomUUID === 'function')
-        ? window.crypto.randomUUID().slice(0, 8)
-        : (Date.now().toString(36) + Math.random().toString(36).slice(2, 10)).slice(0, 8);
+      const rand = (crypto?.randomUUID?.() || (Date.now().toString(36)+Math.random().toString(36))).slice(0, 8);
       sessionId = 'web-' + rand;
       localStorage.setItem('corah_session_id', sessionId);
     }
 
-    const chatEl = document.getElementById('chat');
-    const inputEl = document.getElementById('input');
-    const composerEl = document.getElementById('composer');
-    const sendBtn = document.getElementById('sendBtn');
-    const statusEl = document.getElementById('status');
-    const newChatBtn = document.getElementById('newChatBtn');
+    const chatEl      = document.getElementById('chat');
+    const inputEl     = document.getElementById('input');
+    const composerEl  = document.getElementById('composer');
+    const sendBtn     = document.getElementById('sendBtn');
+    const statusEl    = document.getElementById('status');
+    const newChatBtn  = document.getElementById('newChatBtn');
     const copyLinkBtn = document.getElementById('copyLinkBtn');
 
     // Health ping (optional)
-    fetch(HEALTH_URL, { mode: 'cors' }).then(() => {
-      statusEl.textContent = 'Connected';
-    }).catch(() => {
-      statusEl.textContent = 'Connecting to API failed — check ?api=… or CORS.';
-    });
+    fetch(HEALTH_URL, { mode: 'cors' })
+      .then(() => { statusEl.textContent = 'Connected'; })
+      .catch(() => { statusEl.textContent = 'Connecting to API failed — check ?api=… or CORS.'; });
 
     // -------- UI helpers --------
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -142,16 +137,37 @@
       if (!banner) {
         banner = document.createElement('div');
         banner.className = 'chat-banner';
-        banner.style.cssText = "margin:12px 0;padding:10px;border-radius:6px;font:14px/1.4 system-ui; background:#fff3cd; border:1px solid #ffe58f;";
+        banner.style.cssText = "margin:12px 0;padding:10px;border-radius:6px;font:14px/1.4 system-ui;background:#fff3cd;border:1px solid #ffe58f;";
         chatEl.appendChild(banner);
       }
       banner.textContent = text;
       chatEl.scrollTo({ top: chatEl.scrollHeight, behavior: 'smooth' });
     }
 
+    function removeBanner() {
+      const b = document.querySelector('.chat-banner');
+      if (b) b.remove();
+    }
+
+    let heartbeatTimer = null;
+    let sessionHardClosed = false;
+
+    function startHeartbeat() {
+      stopHeartbeat();
+      heartbeatTimer = setInterval(heartbeat, 60000); // every 60s
+    }
+    function stopHeartbeat() {
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    }
+
     function handleEndSessionFlag(resp) {
       if (resp && resp.end_session) {
+        sessionHardClosed = true;
         disableInput(true);
+        stopHeartbeat();
         showBanner("Chat ended. Start a new chat to continue.");
         // Add a restart button once
         if (!document.getElementById('restart-chat-btn')) {
@@ -169,6 +185,7 @@
     // -------- Submit handler --------
     composerEl.addEventListener('submit', async (e) => {
       e.preventDefault();
+      if (sessionHardClosed) return;
       const q = inputEl.value.trim();
       if (!q) return;
 
@@ -183,10 +200,7 @@
           method: 'POST',
           mode: 'cors',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            session_id: sessionId,
-            question: q,
-          })
+          body: JSON.stringify({ session_id: sessionId, question: q })
         });
 
         if (!res.ok) {
@@ -207,7 +221,7 @@
         addAssistantBubble('Network issue. Please check your connection and try again.');
       } finally {
         setTyping(false);
-        if (!sendBtn.disabled) disableInput(false);
+        if (!sessionHardClosed) disableInput(false);
         inputEl.focus();
       }
     });
@@ -222,8 +236,8 @@
 
     // New chat = fresh session id + clear UI
     newChatBtn.addEventListener('click', async () => {
-      sessionId = (window.crypto?.randomUUID?.() || Math.random().toString(36).slice(2)).slice(0, 8);
-      sessionId = 'web-' + sessionId;
+      const rid = (crypto?.randomUUID?.() || Math.random().toString(36)).slice(0, 8);
+      sessionId = 'web-' + rid;
       localStorage.setItem('corah_session_id', sessionId);
       chatEl.innerHTML = '';
       addAssistantBubble('New chat started. How can I help?');
@@ -233,13 +247,10 @@
       inputEl.focus();
       lastUserActionAt = Date.now();
       frontendWarned = false;
+      sessionHardClosed = false;
       removeBanner();
+      startHeartbeat();
     });
-
-    function removeBanner() {
-      const b = document.querySelector('.chat-banner');
-      if (b) b.remove();
-    }
 
     // Copy shareable link (includes your API base if set)
     copyLinkBtn.addEventListener('click', async () => {
@@ -275,6 +286,7 @@
     });
 
     setInterval(() => {
+      if (sessionHardClosed) return;
       const idleMin = (Date.now() - lastUserActionAt) / 60000;
       if (!frontendWarned && idleMin >= FRONTEND_WARN_AT_MIN) {
         showBanner("I haven’t heard back in a while — I’ll close this chat soon if there’s no reply.");
@@ -282,23 +294,23 @@
       }
     }, 30000);
 
-    // -------- Backend heartbeat: warn/close definitively --------
+    // -------- Backend heartbeat: warn/close once; stop after close --------
     async function heartbeat() {
+      if (sessionHardClosed) { stopHeartbeat(); return; }
       try {
         const res = await fetch(`${PING_URL}?session_id=${encodeURIComponent(sessionId)}`, { mode: 'cors' });
         if (!res.ok) return;
         const data = await res.json();
-        if (data && data.answer) {
-          // Server may send a warning or closing line as an assistant turn
-          addAssistantBubble(data.answer);
-        }
+        if (data && data.answer) addAssistantBubble(data.answer);
         handleEndSessionFlag(data);
-      } catch (e) {
-        // silent fail is OK for heartbeat
+        if (data && data.end_session) stopHeartbeat();
+      } catch (_) {
+        /* silent */
       }
     }
-    setInterval(heartbeat, 60000); // every 60s
 
+    // Kick off heartbeat loop
+    startHeartbeat();
   </script>
 </body>
 </html>

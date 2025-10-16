@@ -12,7 +12,7 @@ from app.retrieval.retriever import search
 _PLANNER_MODEL = os.getenv("OPENAI_PLANNER_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 _FINAL_MODEL   = os.getenv("OPENAI_FINAL_MODEL",   os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 
-# Temperatures (Phase 2: allow separate planner/final temps; fall back to legacy TEMPERATURE)
+# Temperatures (Phase 2: separate planner/final temps; fall back to legacy TEMPERATURE)
 _LEGACY_TEMP   = float(os.getenv("TEMPERATURE", "0.5"))
 _PLANNER_TEMP  = float(os.getenv("PLANNER_TEMPERATURE", os.getenv("PLANNER_TEMP", "0.3")))
 _FINAL_TEMP    = float(os.getenv("FINAL_TEMPERATURE",   os.getenv("FINAL_TEMP",   str(_LEGACY_TEMP))))
@@ -52,37 +52,6 @@ def _extract_ctx_bits(ctx: str) -> Dict[str, str]:
     out["last_asked"]  = m.group(1).strip() if m else ""
     return out
 
-def _extract_signals(ctx_block: str) -> Dict[str, Any]:
-    """
-    Optional section reader. If the orchestrator includes:
-
-      - Signals:
-        sentiment: frustrated
-        intent_level: hot
-
-    we parse it. If absent, returns {} and behaviour is unchanged.
-    """
-    sig_txt = _extract_section(ctx_block, "Signals")
-    if not sig_txt:
-        return {}
-    # tolerate either loose 'key: value' lines or a JSON object
-    sig_txt = sig_txt.strip()
-    try:
-        if sig_txt.startswith("{"):
-            obj = json.loads(sig_txt)
-            if isinstance(obj, dict):
-                return obj
-    except Exception:
-        pass
-    out: Dict[str, Any] = {}
-    for line in sig_txt.splitlines():
-        line = line.strip()
-        if not line or ":" not in line:
-            continue
-        k, v = line.split(":", 1)
-        out[k.strip().lower()] = v.strip()
-    return out
-
 def _chat(model: str, system: str, user: str, temperature: float) -> str:
     resp = _client.chat.completions.create(
         model=model,
@@ -94,17 +63,18 @@ def _chat(model: str, system: str, user: str, temperature: float) -> str:
 def _planner(user_text: str, lead_hint: str = "", current_topic: str = "") -> Dict[str, Any]:
     """
     Classifier/planner. Keeps us on the same thread when the user back-channels
-    with 'yes/sure/tell me more/go ahead/sounds good'.
+    with 'yes/sure/tell me more/go ahead/sounds good'. Prioritises lead flow.
     """
     system = (
         "You are a tiny planner. Return ONLY JSON:\n"
         "{kind:'qa'|'lead'|'contact'|'pricing'|'follow_up_on_current_topic'|'out_of_scope',"
         " needs_retrieval:boolean, search_query:string|null, lead_prompt:string|null}\n"
+        "- If the user expresses intent like 'can you make/build', 'I want', 'interested', 'how much', "
+        "'pricing', 'cost', or provides phone/email/time, classify as 'lead'.\n"
         "- Map 'yes'/'sure'/'okay'/'tell me more'/'go ahead'/'sounds good' to follow_up_on_current_topic "
         "  (do NOT ask which topic; continue the same thread).\n"
-        "- Use 'lead' when user asks to start/arrange a callback or gives phone/email/time.\n"
         "- Use 'out_of_scope' for general trivia not related to the user's project or Corvox.\n"
-        "- needs_retrieval true only when the user asks for factual details about Corvox/products/pricing we might have in KB."
+        "- needs_retrieval true only when the user asks for factual details from KB (products/policies/pricing text)."
     )
     user = (
         f"User text:\n{user_text}\n\n"
@@ -140,48 +110,39 @@ def _final_answer(
     recent_turns: str,
     lead_hint: str,
     last_asked: str,
-    sentiment: str = "neutral",
 ) -> str:
-    # ---- System rules (concise; tone adapts to sentiment) ----
-    tone_rule = (
-        "Tone rules by sentiment:\n"
-        "- frustrated: acknowledge briefly, be extra concise, avoid new CTAs unless strictly necessary, no stacked questions.\n"
-        "- positive: warm and encouraging but still concise; one purposeful question max.\n"
-        "- neutral: default tone.\n"
-        f"Current sentiment: {sentiment or 'neutral'}.\n"
-    )
-
+    # ---- System rules (Phase 2.2 behavioural guard) ----
     system = (
         "You are Corah, Corvox’s warm front-desk assistant—polite, concise, genuinely helpful.\n"
-        + tone_rule +
-        "Core behavior (obey strictly):\n"
-        "1) Keep replies short (1–3 sentences). No filler. Vary openers (avoid repeating 'Hi there!').\n"
-        "2) Ask at most ONE short, purposeful question when it advances the goal. No stacked CTAs.\n"
-        "3) Use [Summary], [Current topic], and [Recent turns] to continue the SAME thread; "
-        "   do NOT re-ask what the user already told you.\n"
-        "4) If you have a Lead hint (ask_<field> or bridge_back_to_<field> or confirm_done), phrase it naturally. "
-        "   If last_asked equals the current ask target, do NOT repeat; briefly acknowledge and gently bridge back.\n"
-        "5) Use [Company contact] ONLY for Corvox’s contact; never treat [User details] as company info.\n"
-        "6) Stay in scope: Corvox services, the user’s project, lead capture, pricing, and our policies. "
-        "   If the user asks general trivia (unrelated), decline briefly and steer back.\n"
-        "7) If the user declines to share contact, respect it and continue helping without nagging.\n"
-        "8) End neutrally when appropriate: 'I’m here if you want to dive deeper.' (no hard CTA).\n"
-        "9) Hallucination guard: do NOT invent prices/timelines/features; if info is missing, say you'll check or prepare options.\n"
-        "10) Do NOT promise to email unless [User details] contains a valid email or phone; otherwise offer to take contact details first.\n"
+        "Conversation priorities (strict):\n"
+        "A) If lead capture is incomplete (missing name OR missing contact (email/phone) OR missing company), "
+        "   prefer asking for exactly ONE missing item that most advances scheduling a discovery call.\n"
+        "B) If user asked for pricing/cost, give a short, safe statement (no hard numbers) and pivot to lead capture.\n"
+        "C) If lead is complete or user says 'no/that’s all/bye', summarise once and close politely.\n"
+        "\n"
+        "Behavioural rules:\n"
+        "1) Keep replies short (1–3 sentences). Avoid filler.\n"
+        "2) Ask at most ONE question only when it advances A/B above. Otherwise use a statement.\n"
+        "3) Use [Summary], [Current topic], and [Recent turns] to stay on the SAME thread; do NOT re-ask known details.\n"
+        "4) Hallucination guard: do NOT invent prices/timelines/features; if info is missing, say so and propose a short discovery call.\n"
+        "5) Brand: Corvox BUILDS custom chat + voice agents (Corah). Do NOT imply we only integrate third-party chatbots.\n"
+        "6) Third-party tools: only mention external plugins if the user explicitly asks for third-party options; otherwise prefer Corah.\n"
+        "7) If last_asked equals the current ask target, do NOT repeat; briefly acknowledge and move to the next most useful step.\n"
+        "8) If user declines to share contact, respect it; continue helping without nagging.\n"
     )
 
-    # ---- Few-shot (tiny) to anchor follow-ups on current topic ----
+    # Minimal few-shot to anchor “continue same topic” without re-asking
     shots = (
         "Example A\n"
-        "[Summary] user exploring WhatsApp chatbot for a jewellery store; wants features.\n"
+        "[Summary] user exploring chatbot for a toy store; wants stock updates.\n"
         "User: yes, tell me more\n"
-        "Assistant: We can start with quick replies for FAQs and stock checks, then add order-tracking. "
-        "If you use Shopify, we can read inventory directly. Would you want stock checks live or from a daily export?\n\n"
+        "Assistant: We can connect inventory to answer “in stock?” in real time and suggest alternatives. "
+        "If you like, I can set a quick discovery call—what's your name and the best email?\n\n"
         "Example B\n"
-        "[Summary] user just asked about pricing for a callback service.\n"
-        "User: sure, go ahead\n"
-        "Assistant: For a simple callback agent, most teams start on our lower tier and add call logging later. "
-        "Ballpark is a small setup + modest monthly. Want me to sketch the two options?\n\n"
+        "[Summary] user just asked about pricing.\n"
+        "User: how much\n"
+        "Assistant: Pricing depends on scope; we start with a short discovery call, then share a clear quote. "
+        "Shall I note your name and email to arrange it?\n\n"
     )
 
     user = (
@@ -220,12 +181,6 @@ def generate_answer(
     bits          = _extract_ctx_bits(ctx_block)
     lead_hint     = bits.get("lead_hint","")
     last_asked    = bits.get("last_asked","")
-
-    # Optional: signals (sentiment/intent) if passed by orchestrator
-    sigs = _extract_signals(ctx_block)
-    sentiment = str(sigs.get("sentiment", "neutral")).lower() if isinstance(sigs, dict) else "neutral"
-    if sentiment not in {"positive","neutral","frustrated"}:
-        sentiment = "neutral"
 
     # Planner
     plan = _planner(user_text, lead_hint=lead_hint, current_topic=current_topic)
@@ -268,7 +223,6 @@ def generate_answer(
         recent_turns=recent_turns,
         lead_hint=lead_hint,
         last_asked=last_asked,
-        sentiment=sentiment,
     ).strip()
 
     # Citations (optional)
