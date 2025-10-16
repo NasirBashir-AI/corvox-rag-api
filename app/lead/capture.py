@@ -7,12 +7,19 @@ import json
 from datetime import datetime, timezone
 from typing import Optional, Tuple, Dict, Any
 
+from app.core.config import (
+    REQUIRE_COMPANY,
+    REQUIRE_EMAIL_OR_PHONE,
+    RECAP_BEFORE_SAVE,
+    END_SESSION_ON_SAVE,
+)
 from app.core.session_mem import (
     get_state,
     set_state,
     mark_asked,
     recently_asked,
     update_summary,
+    set_lead_backup,     # Phase 2
 )
 from app.retrieval.leads import mark_stage, mark_done
 
@@ -195,6 +202,10 @@ def harvest_name(text: str) -> Optional[str]:
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _is_affirmative(s: str) -> bool:
+    s = (s or "").strip().lower()
+    return s in {"yes","yep","yeah","correct","confirm","that's right","thats right","ok","okay","sure","please do","go ahead","sounds good"}
+
 def in_progress(session_id: str) -> bool:
     st = get_state(session_id)
     stage = (st or {}).get("lead_stage")
@@ -293,20 +304,24 @@ def _build_lead_report(st: Dict[str, Any]) -> Dict[str, Any]:
 def take_turn(session_id: str, text: str) -> Dict[str, str]:
     """
     State machine (signals only).
-    Stages: name -> contact -> time -> notes -> done
-    Minimal finalize: require name AND (phone or email). Time optional.
+    Stages: name -> contact -> time -> notes -> confirm -> done
+    Finalize requires:
+      - name present
+      - (email or phone) present
+      - company present if REQUIRE_COMPANY = True
+    Time is optional.
     """
     st = get_state(session_id) or {}
     stage = st.get("lead_stage") or "name"
 
-    # opportunistic harvests every turn
+    # opportunistic harvests every turn (support corrections)
     _maybe_update_company_from(text, session_id)
     _ensure_contact_in_state(session_id, text)
     _ensure_time_in_state(session_id, text)
-    _maybe_update_name_from(text, session_id)  # safe correction
+    _maybe_update_name_from(text, session_id)
 
-    # normalize stage
-    if stage not in {"name", "contact", "time", "notes", "done"}:
+    # normalise stage
+    if stage not in {"name", "contact", "time", "notes", "confirm", "done"}:
         stage = "name"
         set_state(session_id, lead_stage="name")
 
@@ -331,6 +346,13 @@ def take_turn(session_id: str, text: str) -> Dict[str, str]:
     if stage == "contact":
         st_now = get_state(session_id) or {}
         if st_now.get("phone") or st_now.get("email"):
+            # also ensure company if required; ask gently
+            if REQUIRE_COMPANY and not (st_now.get("company") or "").strip():
+                if not recently_asked(session_id, "company", 45):
+                    mark_asked(session_id, "company")
+                    return {"hint":"ask_company"}
+                return {"hint":"bridge_back_to_company"}
+            # then move on
             set_state(session_id, lead_stage="time")
             mark_stage(session_id, stage="time")
             update_summary(session_id)
@@ -356,7 +378,7 @@ def take_turn(session_id: str, text: str) -> Dict[str, str]:
             return {"hint":"ask_contact"}
         return {"hint":"bridge_back_to_contact"}
 
-    # --- TIME (optional, but nice to have) ---
+    # --- TIME (optional, but helpful) ---
     if stage == "time":
         st_now = get_state(session_id) or {}
         pref = st_now.get("preferred_time") or harvest_time(text or "")
@@ -374,57 +396,102 @@ def take_turn(session_id: str, text: str) -> Dict[str, str]:
             return {"hint":"ask_time"}
         return {"hint":"bridge_back_to_time"}
 
-    # --- NOTES + FINALIZE ---
+    # --- NOTES -> CONFIRM (Phase 2 recap gate) ---
     if stage == "notes":
-        # persist notes if any
+        # save user notes if present
         user_notes = (text or "").strip()
         if user_notes:
             set_state(session_id, notes=user_notes)
             update_summary(session_id)
 
-        # gate: require name AND (phone or email)
+        # gate: require name and contact; company if required
         st_now = get_state(session_id) or {}
         has_name = bool(st_now.get("name"))
         has_contact = bool(st_now.get("phone") or st_now.get("email"))
+        has_company = bool((st_now.get("company") or "").strip()) if REQUIRE_COMPANY else True
 
+        if not has_name:
+            if not recently_asked(session_id, "name", 45):
+                mark_asked(session_id, "name")
+                return {"hint":"ask_name"}
+            return {"hint":"bridge_back_to_name"}
+
+        if not has_contact:
+            if not recently_asked(session_id, "contact", 45):
+                mark_asked(session_id, "contact")
+                return {"hint":"ask_contact"}
+            return {"hint":"bridge_back_to_contact"}
+
+        if not has_company:
+            if not recently_asked(session_id, "company", 45):
+                mark_asked(session_id, "company")
+                return {"hint":"ask_company"}
+            return {"hint":"bridge_back_to_company"}
+
+        # Ready to recap
+        report = _build_lead_report(st_now)
+        set_lead_backup(session_id, report)
+        set_state(session_id, lead_stage="confirm")
+        return {"hint":"recap_confirm"}  # generator should read back details and ask to confirm/correct
+
+    # --- CONFIRM (save on affirmative, re-recap on corrections) ---
+    if stage == "confirm":
+        # Opportunistic corrections still apply above; by now state reflects last user turn.
+        st_now = get_state(session_id) or {}
+        has_name = bool(st_now.get("name"))
+        has_contact = bool(st_now.get("phone") or st_now.get("email"))
+        has_company = bool((st_now.get("company") or "").strip()) if REQUIRE_COMPANY else True
+
+        # If any mandatory field is missing (e.g., user removed during correction), bounce back to that
         if not has_name:
             return {"hint":"bridge_back_to_name"}
         if not has_contact:
             return {"hint":"bridge_back_to_contact"}
+        if not has_company:
+            return {"hint":"bridge_back_to_company"}
 
-        # time optional; proceed
+        # If user clearly affirms, save
+        if _is_affirmative(text):
+            report = _build_lead_report(st_now)
+            merged_notes = report
+            user_notes = (st_now.get("notes") or "").strip()
+            if user_notes:
+                merged_notes["details"]["user_notes"] = user_notes
+
+            now_iso = _now_iso()
+            try:
+                mark_stage(
+                    session_id,
+                    stage="done",
+                    name=st_now.get("name"),
+                    phone=st_now.get("phone"),
+                    email=st_now.get("email"),
+                    preferred_time=st_now.get("preferred_time"),
+                    notes=json.dumps(merged_notes),
+                )
+                mark_done(
+                    session_id,
+                    name=st_now.get("name"),
+                    phone=st_now.get("phone"),
+                    email=st_now.get("email"),
+                    preferred_time=st_now.get("preferred_time"),
+                    notes=json.dumps(merged_notes),
+                    done_at=now_iso,
+                )
+                set_state(session_id, lead_stage="done", lead_done_at=now_iso, lead_just_done=True)
+                update_summary(session_id)
+                if END_SESSION_ON_SAVE:
+                    set_state(session_id, end_session=True)
+                return {"hint":"confirm_done"}
+            except Exception:
+                # If DB upsert fails, ask to confirm contact again (soft recovery)
+                return {"hint":"bridge_back_to_contact"}
+
+        # Not an explicit yes: either corrections came in or user is ambiguous → re-issue recap
+        # (opportunistic harvest above already updated state if corrections were typed)
         report = _build_lead_report(st_now)
-        # merge report into notes (stored as JSON text)
-        merged_notes = report
-        if user_notes:
-            merged_notes["details"]["user_notes"] = user_notes
-
-        now_iso = _now_iso()
-        try:
-            mark_stage(
-                session_id,
-                stage="done",
-                name=st_now.get("name"),
-                phone=st_now.get("phone"),
-                email=st_now.get("email"),
-                preferred_time=st_now.get("preferred_time"),
-                notes=json.dumps(merged_notes),
-            )
-            mark_done(
-                session_id,
-                name=st_now.get("name"),
-                phone=st_now.get("phone"),
-                email=st_now.get("email"),
-                preferred_time=st_now.get("preferred_time"),
-                notes=json.dumps(merged_notes),
-                done_at=now_iso,
-            )
-            set_state(session_id, lead_stage="done", lead_done_at=now_iso, lead_just_done=True)
-            update_summary(session_id)
-            return {"hint":"confirm_done"}
-        except Exception:
-            # If DB upsert fails, do not crash the API; ask to confirm contact again.
-            return {"hint":"bridge_back_to_contact"}
+        set_lead_backup(session_id, report)
+        return {"hint":"recap_confirm"}
 
     # --- DONE ---
     if stage == "done":

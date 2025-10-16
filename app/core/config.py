@@ -72,7 +72,7 @@ CHUNK_OVERLAP = _get_int("CHUNK_OVERLAP", 120)
 SHOW_CITATIONS  = _get_bool("SHOW_CITATIONS", False)   # include lightweight citations in responses
 DEBUG_RAG       = _get_bool("DEBUG_RAG", False)        # include retrieval debug info in API output
 
-# LLM style controls
+# LLM style controls (legacy global)
 TEMPERATURE     = _get_float("TEMPERATURE", 0.5)       # friendly but stable by default
 MAX_TOKENS      = _get_int("MAX_TOKENS", 600)          # cap for completion tokens
 MIN_SIM         = _get_float("MIN_SIM", 0.60)          # similarity threshold (0..1) used for diagnostics
@@ -117,6 +117,39 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = _get_int("PORT", 8000)
 
 
+# =========================
+# PHASE 2 ADDITIONS (SAFE)
+# =========================
+
+# 1) Sentiment & intent (enable/disable)
+ENABLE_SENTIMENT = _get_bool("ENABLE_SENTIMENT", True)
+ENABLE_INTENT    = _get_bool("ENABLE_INTENT", True)
+
+# 2) Planner/Final temperatures (keep old TEMPERATURE for legacy paths)
+PLANNER_TEMPERATURE = _get_float("PLANNER_TEMPERATURE", 0.3)
+FINAL_TEMPERATURE   = _get_float("FINAL_TEMPERATURE", 0.5)
+
+# 3) One-question-per-turn behaviour
+ONE_QUESTION_MAX = _get_bool("ONE_QUESTION_MAX", True)
+
+# 4) Lead capture policy
+REQUIRE_COMPANY            = _get_bool("REQUIRE_COMPANY", True)  # name + company + (email or phone)
+REQUIRE_EMAIL_OR_PHONE     = _get_bool("REQUIRE_EMAIL_OR_PHONE", True)
+ALLOW_CORRECTIONS          = _get_bool("ALLOW_CORRECTIONS", True)
+NO_EMAIL_PROMISE_WITHOUT_CONTACT = _get_bool("NO_EMAIL_PROMISE_WITHOUT_CONTACT", True)
+
+# 5) Recap & confirmation before saving
+RECAP_BEFORE_SAVE = _get_bool("RECAP_BEFORE_SAVE", True)
+
+# 6) End-session behaviour
+END_SESSION_ON_SAVE = _get_bool("END_SESSION_ON_SAVE", True)   # after confirmed save, set end_session=True
+THANKS_GUARD        = _get_bool("THANKS_GUARD", True)          # if user says only "thanks", ask once before closing
+
+# 7) Inactivity timings (minutes)
+INACTIVITY_WARN_MIN  = _get_int("INACTIVITY_WARN_MIN", 5)      # show warning at ~5 min
+INACTIVITY_CLOSE_MIN = _get_int("INACTIVITY_CLOSE_MIN", 6)     # auto-close at ~6 min if no reply
+
+
 # ---------- convenience echo (optional) ----------
 def _mask_db_url(u: str) -> str:
     if "://" not in u or "@" not in u:
@@ -151,3 +184,18 @@ if _get_bool("CONFIG_ECHO", False):
     print("[config] CTA_MAX_ATTEMPTS=", CTA_MAX_ATTEMPTS, flush=True)
     print("[config] BACKCHANNEL_KEYWORDS=", BACKCHANNEL_KEYWORDS, flush=True)
     print("[config] AFFIRMATION_KEYWORDS=", AFFIRMATION_KEYWORDS, flush=True)
+    # Phase 2 echoes
+    print("[config] ENABLE_SENTIMENT=", ENABLE_SENTIMENT, flush=True)
+    print("[config] ENABLE_INTENT=", ENABLE_INTENT, flush=True)
+    print("[config] PLANNER_TEMPERATURE=", PLANNER_TEMPERATURE, flush=True)
+    print("[config] FINAL_TEMPERATURE=", FINAL_TEMPERATURE, flush=True)
+    print("[config] ONE_QUESTION_MAX=", ONE_QUESTION_MAX, flush=True)
+    print("[config] REQUIRE_COMPANY=", REQUIRE_COMPANY, flush=True)
+    print("[config] REQUIRE_EMAIL_OR_PHONE=", REQUIRE_EMAIL_OR_PHONE, flush=True)
+    print("[config] ALLOW_CORRECTIONS=", ALLOW_CORRECTIONS, flush=True)
+    print("[config] NO_EMAIL_PROMISE_WITHOUT_CONTACT=", NO_EMAIL_PROMISE_WITHOUT_CONTACT, flush=True)
+    print("[config] RECAP_BEFORE_SAVE=", RECAP_BEFORE_SAVE, flush=True)
+    print("[config] END_SESSION_ON_SAVE=", END_SESSION_ON_SAVE, flush=True)
+    print("[config] THANKS_GUARD=", THANKS_GUARD, flush=True)
+    print("[config] INACTIVITY_WARN_MIN=", INACTIVITY_WARN_MIN, flush=True)
+    print("[config] INACTIVITY_CLOSE_MIN=", INACTIVITY_CLOSE_MIN, flush=True)

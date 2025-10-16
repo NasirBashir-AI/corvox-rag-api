@@ -5,7 +5,8 @@ from typing import Any, Dict, List
 
 from app.generation.generator import client  # reuse the existing OpenAI client
 
-_SYSTEM = (
+# ---- Phase 2: System prompts ----
+_INTENT_SYSTEM = (
     "You are a classifier that labels a short chat transcript for lead intent. "
     "Return strict JSON with keys: interest_level (one of: none, curious, buying, explicit_cta), "
     "confidence (0..1), and signals (array of short lowercase phrases). "
@@ -13,10 +14,19 @@ _SYSTEM = (
     "gave_contact, positive_sentiment, business_described, timeline_soon, budget_mentioned."
 )
 
+_SENTIMENT_SYSTEM = (
+    "You are a sentiment classifier for a short chat transcript. "
+    "Return strict JSON with keys: sentiment (one of: positive, neutral, frustrated) and confidence (0..1). "
+    "Base the classification on the user's most recent turns, but consider brief context."
+)
+
+
 def classify_lead_intent(turns: List[Dict[str, str]]) -> Dict[str, Any]:
     """
     turns: list like [{"role":"user"|"assistant", "content":"..."}]
     returns: {"interest_level": "...", "confidence": 0.0-1.0, "signals": [...]}
+
+    Backwards compatible with existing callers.
     """
     if not turns:
         return {"interest_level": "none", "confidence": 0.0, "signals": []}
@@ -27,7 +37,7 @@ def classify_lead_intent(turns: List[Dict[str, str]]) -> Dict[str, Any]:
             temperature=0.1,
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": _SYSTEM},
+                {"role": "system", "content": _INTENT_SYSTEM},
                 {"role": "user", "content": json.dumps({"turns": turns})},
             ],
         )
@@ -41,6 +51,77 @@ def classify_lead_intent(turns: List[Dict[str, str]]) -> Dict[str, Any]:
         sigs = data.get("signals", [])
         if not isinstance(sigs, list):
             sigs = []
-        return {"interest_level": lvl, "confidence": max(0.0, min(1.0, conf)), "signals": sigs}
+        return {
+            "interest_level": lvl,
+            "confidence": max(0.0, min(1.0, conf)),
+            "signals": sigs,
+        }
     except Exception:
         return {"interest_level": "none", "confidence": 0.0, "signals": []}
+
+
+def classify_sentiment(turns: List[Dict[str, str]]) -> Dict[str, Any]:
+    """
+    returns: {"sentiment": "positive|neutral|frustrated", "confidence": 0.0-1.0}
+    """
+    if not turns:
+        return {"sentiment": "neutral", "confidence": 0.0}
+
+    try:
+        rsp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": _SENTIMENT_SYSTEM},
+                {"role": "user", "content": json.dumps({"turns": turns})},
+            ],
+        )
+        txt = rsp.choices[0].message.content or "{}"
+        data = json.loads(txt)
+        sent = str(data.get("sentiment", "neutral")).lower()
+        if sent not in {"positive", "neutral", "frustrated"}:
+            sent = "neutral"
+        conf = float(data.get("confidence", 0.0))
+        return {"sentiment": sent, "confidence": max(0.0, min(1.0, conf))}
+    except Exception:
+        return {"sentiment": "neutral", "confidence": 0.0}
+
+
+def derive_intent_level(interest_level: str) -> str:
+    """
+    Map detailed intent label to simple level used in memory & UI:
+      none -> cold
+      curious -> warm
+      buying / explicit_cta -> hot
+    """
+    lvl = (interest_level or "").lower()
+    if lvl in {"buying", "explicit_cta"}:
+        return "hot"
+    if lvl == "curious":
+        return "warm"
+    return "cold"
+
+
+def summarise_signals(turns: List[Dict[str, str]]) -> Dict[str, Any]:
+    """
+    Convenience helper for controllers:
+    Returns {
+      'sentiment': 'positive|neutral|frustrated',
+      'intent_level': 'cold|warm|hot',
+      'raw': {
+         'intent': {...}, 'sentiment': {...}
+      }
+    }
+    """
+    intent = classify_lead_intent(turns)
+    senti = classify_sentiment(turns)
+    intent_level = derive_intent_level(intent.get("interest_level", "none"))
+    return {
+        "sentiment": senti.get("sentiment", "neutral"),
+        "intent_level": intent_level,
+        "raw": {
+            "intent": intent,
+            "sentiment": senti,
+        },
+    }

@@ -39,6 +39,7 @@
           <p class="whitespace-pre-wrap">Hello! How can I help today?</p>
         </div>
       </div>
+      <!-- Inactivity / close banners will be appended here -->
     </main>
 
     <!-- Composer -->
@@ -62,21 +63,24 @@
     // -------- Config --------
     // Use same-origin by default. You can override with ?api=https://your-server:8000
     const urlParams = new URLSearchParams(location.search);
-    const API_BASE = (urlParams.get('api') || 'http://ec2-44-208-12-236.compute-1.amazonaws.com:8000/api')
-    .replace(/\/+$/, '');
-	const HEALTH_URL = API_BASE + '/health';
-	const CHAT_URL = API_BASE + '/chat';
+    const API_BASE = (urlParams.get('api') || 'http://ec2-44-208-12-236.compute-1.amazonaws.com:8000/api').replace(/\/+$/, '');
+    const HEALTH_URL = API_BASE + '/health';
+    const CHAT_URL = API_BASE + '/chat';
+    const PING_URL = API_BASE + '/ping';
+
+    // Inactivity knobs (mirror server; warn ~1 minute before close)
+    const INACTIVITY_MINUTES = 5;
+    const FRONTEND_WARN_AT_MIN = Math.max(1, INACTIVITY_MINUTES - 1);
 
     // Keep one session per browser tab unless "New chat"
     let sessionId = localStorage.getItem('corah_session_id');
-	if (!sessionId) {
-  	  const rand =
-    	(window.crypto && typeof window.crypto.randomUUID === 'function')
-      		? window.crypto.randomUUID().slice(0, 8)
-      		: (Date.now().toString(36) + Math.random().toString(36).slice(2, 10)).slice(0, 8);
-  	  sessionId = 'web-' + rand;
-  	  localStorage.setItem('corah_session_id', sessionId);
-	}
+    if (!sessionId) {
+      const rand = (window.crypto && typeof window.crypto.randomUUID === 'function')
+        ? window.crypto.randomUUID().slice(0, 8)
+        : (Date.now().toString(36) + Math.random().toString(36).slice(2, 10)).slice(0, 8);
+      sessionId = 'web-' + rand;
+      localStorage.setItem('corah_session_id', sessionId);
+    }
 
     const chatEl = document.getElementById('chat');
     const inputEl = document.getElementById('input');
@@ -93,8 +97,9 @@
       statusEl.textContent = 'Connecting to API failed — check ?api=… or CORS.';
     });
 
-    // Helpers
+    // -------- UI helpers --------
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
     function addUserBubble(text) {
       const wrapper = document.createElement('div');
       wrapper.className = 'flex gap-3 mb-4 justify-end';
@@ -108,6 +113,7 @@
       chatEl.appendChild(wrapper);
       chatEl.scrollTo({ top: chatEl.scrollHeight, behavior: 'smooth' });
     }
+
     function addAssistantBubble(text) {
       const wrapper = document.createElement('div');
       wrapper.className = 'flex gap-3 mb-4';
@@ -121,27 +127,56 @@
       chatEl.appendChild(wrapper);
       chatEl.scrollTo({ top: chatEl.scrollHeight, behavior: 'smooth' });
     }
+
     function setTyping(on) {
-      if (on) {
-        statusEl.textContent = 'Corah is typing…';
-      } else {
-        statusEl.textContent = '';
-      }
+      statusEl.textContent = on ? 'Corah is typing…' : '';
     }
+
     function disableInput(on) {
       inputEl.disabled = on;
       sendBtn.disabled = on;
     }
 
-    // Submit handler
+    function showBanner(text) {
+      let banner = document.querySelector('.chat-banner');
+      if (!banner) {
+        banner = document.createElement('div');
+        banner.className = 'chat-banner';
+        banner.style.cssText = "margin:12px 0;padding:10px;border-radius:6px;font:14px/1.4 system-ui; background:#fff3cd; border:1px solid #ffe58f;";
+        chatEl.appendChild(banner);
+      }
+      banner.textContent = text;
+      chatEl.scrollTo({ top: chatEl.scrollHeight, behavior: 'smooth' });
+    }
+
+    function handleEndSessionFlag(resp) {
+      if (resp && resp.end_session) {
+        disableInput(true);
+        showBanner("Chat ended. Start a new chat to continue.");
+        // Add a restart button once
+        if (!document.getElementById('restart-chat-btn')) {
+          const btn = document.createElement('button');
+          btn.id = 'restart-chat-btn';
+          btn.textContent = 'Start New Chat';
+          btn.className = 'ml-2 px-3 py-1.5 rounded-lg border hover:bg-slate-50';
+          btn.onclick = () => window.location.reload();
+          document.querySelector('.chat-banner')?.appendChild(btn);
+        }
+        statusEl.textContent = 'Conversation closed. Start a new chat to continue.';
+      }
+    }
+
+    // -------- Submit handler --------
     composerEl.addEventListener('submit', async (e) => {
       e.preventDefault();
       const q = inputEl.value.trim();
       if (!q) return;
+
       addUserBubble(q);
       inputEl.value = '';
       disableInput(true);
       setTyping(true);
+      markUserActivity(); // reset local idle timer on send
 
       try {
         const res = await fetch(CHAT_URL, {
@@ -151,8 +186,6 @@
           body: JSON.stringify({
             session_id: sessionId,
             question: q,
-            // You can pass optional flags if you enabled them server-side:
-            // debug: false, citations: false
           })
         });
 
@@ -163,11 +196,10 @@
         } else {
           const data = await res.json();
           addAssistantBubble(data.answer || '(no reply)');
+          handleEndSessionFlag(data);
           if (data.end_session) {
             setTyping(false);
-            disableInput(true);
-            statusEl.textContent = 'Conversation closed. Start a new chat to continue.';
-            return;
+            return; // keep input disabled
           }
         }
       } catch (err) {
@@ -175,7 +207,7 @@
         addAssistantBubble('Network issue. Please check your connection and try again.');
       } finally {
         setTyping(false);
-        disableInput(false);
+        if (!sendBtn.disabled) disableInput(false);
         inputEl.focus();
       }
     });
@@ -190,7 +222,8 @@
 
     // New chat = fresh session id + clear UI
     newChatBtn.addEventListener('click', async () => {
-      sessionId = 'web-' + crypto.randomUUID().slice(0, 8);
+      sessionId = (window.crypto?.randomUUID?.() || Math.random().toString(36).slice(2)).slice(0, 8);
+      sessionId = 'web-' + sessionId;
       localStorage.setItem('corah_session_id', sessionId);
       chatEl.innerHTML = '';
       addAssistantBubble('New chat started. How can I help?');
@@ -198,7 +231,15 @@
       sendBtn.disabled = false;
       statusEl.textContent = '';
       inputEl.focus();
+      lastUserActionAt = Date.now();
+      frontendWarned = false;
+      removeBanner();
     });
+
+    function removeBanner() {
+      const b = document.querySelector('.chat-banner');
+      if (b) b.remove();
+    }
 
     // Copy shareable link (includes your API base if set)
     copyLinkBtn.addEventListener('click', async () => {
@@ -216,6 +257,48 @@
         inputEl.focus();
       }
     });
+
+    // -------- Inactivity: frontend banner (80% of timeout) --------
+    let lastUserActionAt = Date.now();
+    let frontendWarned = false;
+
+    function markUserActivity() {
+      lastUserActionAt = Date.now();
+      if (frontendWarned) {
+        removeBanner();
+        frontendWarned = false;
+      }
+    }
+
+    ['keydown','click','input'].forEach(evt => {
+      inputEl.addEventListener(evt, markUserActivity);
+    });
+
+    setInterval(() => {
+      const idleMin = (Date.now() - lastUserActionAt) / 60000;
+      if (!frontendWarned && idleMin >= FRONTEND_WARN_AT_MIN) {
+        showBanner("I haven’t heard back in a while — I’ll close this chat soon if there’s no reply.");
+        frontendWarned = true;
+      }
+    }, 30000);
+
+    // -------- Backend heartbeat: warn/close definitively --------
+    async function heartbeat() {
+      try {
+        const res = await fetch(`${PING_URL}?session_id=${encodeURIComponent(sessionId)}`, { mode: 'cors' });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data && data.answer) {
+          // Server may send a warning or closing line as an assistant turn
+          addAssistantBubble(data.answer);
+        }
+        handleEndSessionFlag(data);
+      } catch (e) {
+        // silent fail is OK for heartbeat
+      }
+    }
+    setInterval(heartbeat, 60000); // every 60s
+
   </script>
 </body>
 </html>

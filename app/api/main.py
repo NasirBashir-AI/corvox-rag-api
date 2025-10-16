@@ -25,9 +25,14 @@ from app.core.config import (
     RETRIEVAL_TOP_K,
     LEAD_NUDGE_COOLDOWN_SEC,
     LEAD_MAX_NUDGES,
+    INACTIVITY_MINUTES,
+    CTA_COOLDOWN_TURNS,
+    CTA_MAX_ATTEMPTS,
 )
 from app.retrieval.retriever import search, get_facts
 from app.generation.generator import generate_answer
+# Use the lightweight classifier you already have
+from app.generation.lead_intent import classify_lead_intent
 from app.lead.capture import (
     in_progress as lead_in_progress,
     start as lead_start,
@@ -48,7 +53,7 @@ from app.core.session_mem import (
 
 app = FastAPI(
     title="Corah API",
-    version="1.0.0",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url=None,
     openapi_url="/openapi.json",
@@ -70,6 +75,55 @@ app.add_middleware(
 @app.get("/api/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(ok=True)
+
+# Optional config strings; if you didn't add them, these fallbacks are used
+try:
+    from app.core.config import INACTIVITY_WARN_MSG, INACTIVITY_CLOSE_MSG
+except Exception:
+    INACTIVITY_WARN_MSG  = "I haven’t heard back in a while — I’ll close this chat soon if there’s no reply."
+    INACTIVITY_CLOSE_MSG = ("This chat is now closing due to inactivity. You can start a new one anytime. "
+                            "New chats won’t carry over this conversation.")
+
+@app.get("/api/ping", response_model=ChatResponse)
+def api_ping(session_id: str) -> ChatResponse:
+    """
+    Lightweight heartbeat:
+      - If idle >= INACTIVITY_MINUTES: close and return end_session=True (with closing message)
+      - Else if idle >= INACTIVITY_MINUTES-1 and we haven't warned: return a warning once
+      - Else: no-op (empty answer)
+    """
+    now = datetime.now(timezone.utc)
+    st = get_state(session_id) or {}
+    last_user_iso = st.get("last_user_at")
+    inactivity_warned = bool(st.get("inactivity_warned"))
+    inactivity_minutes = max(1, int(INACTIVITY_MINUTES))
+    warn_after = max(1, inactivity_minutes - 1)
+
+    if not last_user_iso:
+        return ChatResponse(answer="", end_session=False)
+
+    try:
+        last_user_dt = datetime.fromisoformat(last_user_iso)
+        idle_secs = (now - last_user_dt).total_seconds()
+    except Exception:
+        return ChatResponse(answer="", end_session=False)
+
+    # Close
+    if idle_secs >= inactivity_minutes * 60:
+        msg = INACTIVITY_CLOSE_MSG
+        set_state(session_id, end_session=True, inactivity_warned=False)
+        append_turn(session_id, "assistant", msg)
+        return ChatResponse(answer=msg, end_session=True)
+
+    # One-time warning
+    if idle_secs >= warn_after * 60 and not inactivity_warned:
+        set_state(session_id, inactivity_warned=True)
+        warn = INACTIVITY_WARN_MSG
+        append_turn(session_id, "assistant", warn)
+        return ChatResponse(answer=warn, end_session=False)
+
+    # No-op
+    return ChatResponse(answer="", end_session=False)
 
 # ---------------------------
 # Retrieval probe
@@ -95,6 +149,32 @@ def api_search(q: str = Query(..., min_length=1), k: int = Query(RETRIEVAL_TOP_K
         raise HTTPException(status_code=500, detail=f"search_failed: {type(e).__name__}: {e}")
 
 # ---------------------------
+# Helpers
+# ---------------------------
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _sec(delta: timedelta) -> float:
+    return delta.total_seconds()
+
+def _build_signals(turns_last6: List[dict]) -> dict:
+    """
+    Map your tiny classifier output to Phase-2 signals.
+    """
+    cls = classify_lead_intent(turns_last6 or [])
+    # intent_level
+    if cls.get("interest") in ("explicit_cta",):
+        intent_level = "hot"
+    elif cls.get("interest") in ("buying",):
+        intent_level = "warm"
+    else:
+        intent_level = "cold"
+    # sentiment (simple, safe default)
+    sentiment = "positive" if intent_level in ("warm", "hot") else "neutral"
+    return {"sentiment": sentiment, "intent_level": intent_level}
+
+# ---------------------------
 # Chat (LLM-first orchestration)
 # ---------------------------
 
@@ -111,10 +191,45 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=400, detail="empty_question")
 
     session_id = req.session_id
-    now = datetime.now(timezone.utc)
+    now = _now()
 
-    # record the user turn so heuristics/LLM see the latest message
+    # -------- Inactivity: warn/close before doing any heavy work --------
+    st0 = get_state(session_id) or {}
+    last_user_iso = st0.get("last_user_at")
+    inactivity_warned = bool(st0.get("inactivity_warned"))
+    inactivity_minutes = max(1, int(INACTIVITY_MINUTES))
+    warn_after = max(1, inactivity_minutes - 1)  # warn ~1 minute before close
+    should_warn = False
+    should_close = False
+
+    if last_user_iso:
+        try:
+            last_user_dt = datetime.fromisoformat(last_user_iso)
+            idle_secs = _sec(now - last_user_dt)
+            if idle_secs >= inactivity_minutes * 60:
+                should_close = True
+            elif idle_secs >= warn_after * 60 and not inactivity_warned:
+                should_warn = True
+        except Exception:
+            pass
+
+    # If we must close due to inactivity, short-circuit
+    if should_close:
+        set_state(session_id, end_session=True, inactivity_warned=False)  # clear warn flag
+        msg = (
+            "This chat is now closing due to inactivity. You can start a new one anytime. "
+            "New chats won’t carry over this conversation."
+        )
+        append_turn(session_id, "assistant", msg)
+        return ChatResponse(answer=msg, end_session=True)
+
+    # If we should warn, emit a gentle warning but continue
+    if should_warn:
+        set_state(session_id, inactivity_warned=True)
+
+    # -------- Record the user turn, update last_user_at --------
     append_turn(session_id, "user", q)
+    set_state(session_id, last_user_at=now.isoformat())
 
     # ----- 1) Opportunistic short-term memory (light harvest) -----
     state = get_state(session_id) or {}
@@ -144,9 +259,17 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     if nudge_at_iso:
         try:
             last_dt = datetime.fromisoformat(nudge_at_iso)
-            recent_nudge = (now - last_dt) < timedelta(seconds=LEAD_NUDGE_COOLDOWN_SEC)
+            recent_nudge = (_now() - last_dt) < timedelta(seconds=LEAD_NUDGE_COOLDOWN_SEC)
         except Exception:
             recent_nudge = False
+
+    # CTA cooldown/limits (tracked in session JSON without schema changes)
+    turns_list = (get_state(session_id) or {}).get("turns") or []
+    current_turn_idx = len(turns_list)  # after appending user turn
+    cta_attempts = int(state.get("cta_attempts") or 0)
+    cta_last_turn = int(state.get("cta_last_turn") or -9999)
+    cta_cooldown_ok = (current_turn_idx - cta_last_turn) >= int(CTA_COOLDOWN_TURNS)
+    cta_budget_ok = cta_attempts < int(CTA_MAX_ATTEMPTS)
 
     # ----- 2) Controller signals (no copy) -----
     lead_signal = None  # e.g., {"hint":"ask_contact"} | {"hint":"bridge_back_to_time"} | {"hint":"confirm_done"}
@@ -162,13 +285,23 @@ def api_chat(req: ChatRequest) -> ChatResponse:
             or any(kw in ql for kw in ["start", "begin", "i want to start", "how do i start", "i'm ready", "let's go"])
             or bool(phone or email or preferred_time)
         )
-        can_nudge = (not already_started) and (not already_done) and (not recent_nudge) and (nudge_count < LEAD_MAX_NUDGES)
+        can_nudge = (
+            (not already_started)
+            and (not already_done)
+            and (not recent_nudge)
+            and cta_cooldown_ok
+            and cta_budget_ok
+        )
         if trigger and can_nudge:
             lead_signal = lead_start(session_id, kind="callback")  # returns {"hint":"ask_name"} (cooldown-aware)
-            set_state(session_id,
-                      lead_started_at=now.isoformat(),
-                      lead_nudge_at=now.isoformat(),
-                      lead_nudge_count=nudge_count + 1)
+            set_state(
+                session_id,
+                lead_started_at=_now().isoformat(),
+                lead_nudge_at=_now().isoformat(),
+                lead_nudge_count=nudge_count + 1,
+                cta_attempts=cta_attempts + 1,
+                cta_last_turn=current_turn_idx,
+            )
 
     # Map controller signal to a compact hint string for the generator
     hint_str: Optional[str] = None
@@ -189,6 +322,12 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     pricing_context = ""
     if facts.get("pricing_overview"): pricing_context += f"Overview: {facts['pricing_overview']}\n"
     if facts.get("pricing_bullet"):   pricing_context += f"Key point: {facts['pricing_bullet']}\n"
+
+    # ----- Signals (sentiment/intent) for tone/adaptive behaviour -----
+    turns6 = recent_turns(session_id, n=6) or []
+    sigs = _build_signals(turns6)
+    # Persist to session for visibility/debug (no schema change)
+    set_state(session_id, sentiment=sigs.get("sentiment"), intent_level=sigs.get("intent_level"))
 
     # ----- 4) Compose augmented question for the generator -----
     st_now = get_state(session_id) or {}
@@ -213,13 +352,12 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     if ts_map:
         last_asked = max(ts_map.items(), key=lambda kv: kv[1])[0]
 
-    # recent turns (last 6)
+    # recent turns (last 6) -> compact text
     def _fmt_turn(t: dict) -> str:
         role = t.get("role","")
         content = (t.get("content","") or "").strip()
         return f"{role.capitalize()}: {content}"
-    turns = recent_turns(session_id, n=6) or []
-    recent_block = "\n".join(_fmt_turn(t) for t in turns) if turns else "None"
+    recent_block = "\n".join(_fmt_turn(t) for t in turns6) if turns6 else "None"
 
     summary_text = st_now.get("session_summary") or "-"
     current_topic = st_now.get("current_topic") or "-"
@@ -228,6 +366,14 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     if hint_str:     hint_lines.append(f"Lead hint: {hint_str}")
     if last_asked:   hint_lines.append(f"last_asked: {last_asked}")
     hint_blob = ("\n".join(hint_lines) + "\n") if hint_lines else ""
+
+    # NEW: Signals block for generator tone control
+    signals_block = f"- Signals:\n  sentiment: {sigs.get('sentiment','neutral')}\n  intent_level: {sigs.get('intent_level','cold')}\n"
+
+    # Inactivity warning line in-context (so the writer can nudge kindly once)
+    inactivity_line = "None"
+    if should_warn:
+        inactivity_line = f"Warn: user idle ~{warn_after} min; prepare to close if no response."
 
     augmented_q = (
         f"{q}\n\n"
@@ -238,7 +384,9 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         f"- User details:\n{user_details}\n"
         f"- Company contact:\n{contact_context or 'None'}\n"
         f"- Pricing:\n{pricing_context or 'None'}\n"
+        f"{signals_block}"
         f"{hint_blob}"
+        f"- Inactivity:\n{inactivity_line}\n"
         f"[End Context]\n"
     )
 
@@ -254,45 +402,29 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     answer = (result.get("answer") or "").strip()
     append_turn(session_id, "assistant", answer)
 
-    # One-shot session close if we JUST finished the lead
-    end_session = False
+    # Gather recap (if we are at the confirm stage)
     st_after = get_state(session_id) or {}
+    recap = None
+    if (st_after.get("lead_stage") == "confirm") and st_after.get("lead_backup"):
+        recap = st_after.get("lead_backup")
+
+    # Session close signal
+    end_session = False
     if st_after.get("lead_just_done"):
         end_session = True
         set_state(session_id, lead_just_done=False)
+    # also respect explicit end_session flag (e.g., inactivity close)
+    if bool(st_after.get("end_session")):
+        end_session = True
 
     return ChatResponse(
         answer=answer,
         citations=result.get("citations"),
         debug=result.get("debug"),
         end_session=end_session,
+        signals={
+            "sentiment": sigs.get("sentiment"),
+            "intent_level": sigs.get("intent_level"),
+        },
+        recap=recap,
     )
-
-# ---------------------------
-# Tiny heuristic classifier (optional, kept)
-# ---------------------------
-
-def classify_lead_intent(turns: List[dict]) -> dict:
-    text = " ".join(t.get("content", "") for t in turns[-4:])
-    t = text.lower()
-    explicit_cta_terms = [
-        "callback", "call back",
-        "book a call", "schedule a call", "set up a call", "arrange a call",
-        "call me", "can you call",
-        "how do i start", "let's start", "get started", "sign me up", "move forward",
-        "can we talk"
-    ]
-    buying_terms = [
-        "i like this", "sounds good", "i’m interested", "i am interested",
-        "this is good", "want this", "we want this", "we need this"
-    ]
-    contact_given = ("@" in t) or any(k in t for k in ["phone", "call me on", "+", "whatsapp"])
-    explicit_cta = any(kw in t for kw in explicit_cta_terms)
-    buying = any(kw in t for kw in buying_terms)
-    if explicit_cta:
-        return {"interest": "explicit_cta", "explicit_cta": True, "contact_given": contact_given, "confidence": 0.9}
-    if contact_given:
-        return {"interest": "buying", "explicit_cta": False, "contact_given": True, "confidence": 0.8}
-    if buying:
-        return {"interest": "buying", "explicit_cta": False, "contact_given": False, "confidence": 0.7}
-    return {"interest": "curious", "explicit_cta": False, "contact_given": False, "confidence": 0.4}

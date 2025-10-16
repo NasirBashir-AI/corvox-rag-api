@@ -8,11 +8,18 @@ from openai import OpenAI
 from app.core.utils import normalize_ws
 from app.retrieval.retriever import search
 
+# Models
 _PLANNER_MODEL = os.getenv("OPENAI_PLANNER_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 _FINAL_MODEL   = os.getenv("OPENAI_FINAL_MODEL",   os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
-_TEMPERATURE   = float(os.getenv("TEMPERATURE", "0.5"))
+
+# Temperatures (Phase 2: allow separate planner/final temps; fall back to legacy TEMPERATURE)
+_LEGACY_TEMP   = float(os.getenv("TEMPERATURE", "0.5"))
+_PLANNER_TEMP  = float(os.getenv("PLANNER_TEMPERATURE", os.getenv("PLANNER_TEMP", "0.3")))
+_FINAL_TEMP    = float(os.getenv("FINAL_TEMPERATURE",   os.getenv("FINAL_TEMP",   str(_LEGACY_TEMP))))
 
 _client = OpenAI()
+# Export for lead_intent.py compatibility
+client = _client
 
 _CTX_START = "[Context]"
 _CTX_END   = "[End Context]"
@@ -45,7 +52,38 @@ def _extract_ctx_bits(ctx: str) -> Dict[str, str]:
     out["last_asked"]  = m.group(1).strip() if m else ""
     return out
 
-def _chat(model: str, system: str, user: str, temperature: float = _TEMPERATURE) -> str:
+def _extract_signals(ctx_block: str) -> Dict[str, Any]:
+    """
+    Optional section reader. If the orchestrator includes:
+
+      - Signals:
+        sentiment: frustrated
+        intent_level: hot
+
+    we parse it. If absent, returns {} and behaviour is unchanged.
+    """
+    sig_txt = _extract_section(ctx_block, "Signals")
+    if not sig_txt:
+        return {}
+    # tolerate either loose 'key: value' lines or a JSON object
+    sig_txt = sig_txt.strip()
+    try:
+        if sig_txt.startswith("{"):
+            obj = json.loads(sig_txt)
+            if isinstance(obj, dict):
+                return obj
+    except Exception:
+        pass
+    out: Dict[str, Any] = {}
+    for line in sig_txt.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        out[k.strip().lower()] = v.strip()
+    return out
+
+def _chat(model: str, system: str, user: str, temperature: float) -> str:
     resp = _client.chat.completions.create(
         model=model,
         temperature=temperature,
@@ -75,7 +113,7 @@ def _planner(user_text: str, lead_hint: str = "", current_topic: str = "") -> Di
         "Back-channel words to treat as follow-up: yes, sure, ok, okay, go ahead, tell me more, sounds good."
     )
 
-    raw = _chat(_PLANNER_MODEL, system, user, temperature=0.0)
+    raw = _chat(_PLANNER_MODEL, system, user, temperature=_PLANNER_TEMP)
     try:
         obj = json.loads(raw)
         if isinstance(obj, dict):
@@ -102,10 +140,20 @@ def _final_answer(
     recent_turns: str,
     lead_hint: str,
     last_asked: str,
+    sentiment: str = "neutral",
 ) -> str:
-    # ---- System rules (concise; no tone overhaul) ----
+    # ---- System rules (concise; tone adapts to sentiment) ----
+    tone_rule = (
+        "Tone rules by sentiment:\n"
+        "- frustrated: acknowledge briefly, be extra concise, avoid new CTAs unless strictly necessary, no stacked questions.\n"
+        "- positive: warm and encouraging but still concise; one purposeful question max.\n"
+        "- neutral: default tone.\n"
+        f"Current sentiment: {sentiment or 'neutral'}.\n"
+    )
+
     system = (
         "You are Corah, Corvox’s warm front-desk assistant—polite, concise, genuinely helpful.\n"
+        + tone_rule +
         "Core behavior (obey strictly):\n"
         "1) Keep replies short (1–3 sentences). No filler. Vary openers (avoid repeating 'Hi there!').\n"
         "2) Ask at most ONE short, purposeful question when it advances the goal. No stacked CTAs.\n"
@@ -118,6 +166,8 @@ def _final_answer(
         "   If the user asks general trivia (unrelated), decline briefly and steer back.\n"
         "7) If the user declines to share contact, respect it and continue helping without nagging.\n"
         "8) End neutrally when appropriate: 'I’m here if you want to dive deeper.' (no hard CTA).\n"
+        "9) Hallucination guard: do NOT invent prices/timelines/features; if info is missing, say you'll check or prepare options.\n"
+        "10) Do NOT promise to email unless [User details] contains a valid email or phone; otherwise offer to take contact details first.\n"
     )
 
     # ---- Few-shot (tiny) to anchor follow-ups on current topic ----
@@ -148,7 +198,7 @@ def _final_answer(
         f"[last_asked]\n{last_asked or 'None'}\n\n"
         "Now reply as Corah following the rules above."
     )
-    return _chat(model, system, user, temperature=_TEMPERATURE)
+    return _chat(model, system, user, temperature=_FINAL_TEMP)
 
 def generate_answer(
     question: str,
@@ -171,6 +221,12 @@ def generate_answer(
     lead_hint     = bits.get("lead_hint","")
     last_asked    = bits.get("last_asked","")
 
+    # Optional: signals (sentiment/intent) if passed by orchestrator
+    sigs = _extract_signals(ctx_block)
+    sentiment = str(sigs.get("sentiment", "neutral")).lower() if isinstance(sigs, dict) else "neutral"
+    if sentiment not in {"positive","neutral","frustrated"}:
+        sentiment = "neutral"
+
     # Planner
     plan = _planner(user_text, lead_hint=lead_hint, current_topic=current_topic)
     kind = plan.get("kind","qa")
@@ -188,10 +244,10 @@ def generate_answer(
             for h in raw_hits:
                 snippet = normalize_ws(h.get("content", "")).strip()
                 title = (h.get("title") or "")[:120]
-                if not snippet: 
+                if not snippet:
                     continue
                 one = f"[{title}] {snippet}"
-                if total + len(one) > max_context_chars: 
+                if total + len(one) > max_context_chars:
                     break
                 pieces.append(one); total += len(one)
             hits = raw_hits
@@ -212,6 +268,7 @@ def generate_answer(
         recent_turns=recent_turns,
         lead_hint=lead_hint,
         last_asked=last_asked,
+        sentiment=sentiment,
     ).strip()
 
     # Citations (optional)
@@ -220,7 +277,7 @@ def generate_answer(
         seen = set()
         for h in hits:
             key = (h.get("title"), h.get("source_uri"))
-            if key in seen: 
+            if key in seen:
                 continue
             seen.add(key)
             citations.append({

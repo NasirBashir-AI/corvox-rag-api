@@ -68,8 +68,20 @@ class Citation(BaseModel):
     source_uri: Optional[str] = None  # optional, if available
 
 
+class ChatSignals(BaseModel):
+    sentiment: Optional[str] = Field(default=None, description="positive | neutral | frustrated")
+    intent_level: Optional[str] = Field(default=None, description="cold | warm | hot")
+
+
 class ChatResponse(BaseModel):
     answer: str
     citations: Optional[List[Citation]] = None
     debug: Optional[Dict[str, Any]] = None
     end_session: bool = False   # UI can close on true
+
+    # Phase 2 (optional extras)
+    signals: Optional[ChatSignals] = None
+    recap: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="If present, a recap of details to confirm before saving."
+    )
