@@ -265,3 +265,18 @@ def set_session_closed(session_id: str, closed: bool = True) -> None:
 def is_session_closed(session_id: str) -> bool:
     st = get_state(session_id)
     return bool(st.get("session_closed"))
+
+# ---------- optional: keep a compact lead recap in session state ----------
+from typing import Any, Dict  # (already present at top; keep if needed)
+
+def set_lead_backup(session_id: str, report: Dict[str, Any]) -> None:
+    """
+    Store a compact lead recap/report in the per-session state so the frontend
+    or admin tools can read it even if DB write fails. Safe, JSON-serializable.
+    """
+    try:
+        # Minimal: just persist under 'lead_backup'
+        set_state(session_id, lead_backup=report)
+    except Exception:
+        # Never crash the API because of backup
+        pass
