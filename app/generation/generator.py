@@ -26,6 +26,12 @@ _CTX_END   = "[End Context]"
 _LEAD_HINT_RE = re.compile(r"^Lead hint:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 _LAST_ASKED_RE = re.compile(r"^last_asked\s*:\s*([A-Za-z_]+)\s*$", re.IGNORECASE | re.MULTILINE)
 
+# NEW: lightweight pricing intent detector (keeps us from inventing “tiers”)
+_PRICING_RE = re.compile(
+    r"\b(price|pricing|cost|how\s*much|budget|quote|estimate|charges?|fees?)\b",
+    re.IGNORECASE,
+)
+
 def _split_user_and_ctx(q: str) -> Tuple[str, str]:
     if _CTX_START in q and _CTX_END in q:
         head, rest = q.split(_CTX_START, 1)
@@ -114,10 +120,14 @@ def _final_answer(
     # ---- System rules (Phase 2.2 behavioural guard) ----
     system = (
         "You are Corah, Corvox’s warm front-desk assistant—polite, concise, genuinely helpful.\n"
+        "Help-first rule: Always answer the user's question before asking for contact details. "
+        "Only ask for name, company, or contact if the user shows sales intent "
+        "(pricing, demo, quote, trial, contact), or after 2–3 turns. "
+        "Never insist on a discovery call before helping.\n"
         "Conversation priorities (strict):\n"
         "A) If lead capture is incomplete (missing name OR missing contact (email/phone) OR missing company), "
         "   prefer asking for exactly ONE missing item that most advances scheduling a discovery call.\n"
-        "B) If user asked for pricing/cost, give a short, safe statement (no hard numbers) and pivot to lead capture.\n"
+        "B) If user asked for pricing/cost, give a short, safe statement (no hard numbers or rigid 'tiers') and pivot with ONE brief ask.\n"
         "C) If lead is complete or user says 'no/that’s all/bye', summarise once and close politely.\n"
         "\n"
         "Behavioural rules:\n"
@@ -129,6 +139,7 @@ def _final_answer(
         "6) Third-party tools: only mention external plugins if the user explicitly asks for third-party options; otherwise prefer Corah.\n"
         "7) If last_asked equals the current ask target, do NOT repeat; briefly acknowledge and move to the next most useful step.\n"
         "8) If user declines to share contact, respect it; continue helping without nagging.\n"
+        "9) When the user says 'no', 'that’s all', or 'bye', summarise once, thank politely, then close the chat (no further questions).\n"
     )
 
     # Minimal few-shot to anchor “continue same topic” without re-asking
@@ -186,6 +197,11 @@ def generate_answer(
     plan = _planner(user_text, lead_hint=lead_hint, current_topic=current_topic)
     kind = plan.get("kind","qa")
     needs_retrieval = bool(plan.get("needs_retrieval", True))
+
+    # NEW: nudge the generator when user directly asked about pricing
+    # (Don’t change DB state here — this is UI/LLM-level behaviour only.)
+    if not lead_hint and _PRICING_RE.search(user_text or ""):
+        lead_hint = "ask_contact"   # one gentle ask after a safe pricing statement
 
     # Retrieval (bounded)
     hits: List[Dict[str, Any]] = []
