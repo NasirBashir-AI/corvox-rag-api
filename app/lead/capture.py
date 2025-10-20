@@ -2,7 +2,10 @@
 from __future__ import annotations
 import re
 from typing import Dict, Optional
-from app.core.session_mem import get_session, update_session
+from app.core.session_mem import (
+    get_state as get_session,
+    set_state as update_session,
+)
 
 # ---- Lead field extractors ----
 _EMAIL_RE = re.compile(r"[\w\.-]+@[\w\.-]+\.\w+", re.IGNORECASE)
