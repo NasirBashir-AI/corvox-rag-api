@@ -1,6 +1,10 @@
 <!doctype html>
 <html lang="en">
 <head>
+  <!-- put this very high in <head> or just before your app bundle -->
+<script>
+  window.API_BASE = "https://api.corvox.co.uk/api";
+</script>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Corah • Chat</title>
@@ -61,11 +65,20 @@
 
   <script>
     // -------- Config --------
-    const urlParams = new URLSearchParams(location.search);
-    const API_BASE  = (urlParams.get('api') || 'http://ec2-44-208-12-236.compute-1.amazonaws.com:8000/api').replace(/\/+$/, '');
-    const HEALTH_URL= API_BASE + '/health';
-    const CHAT_URL  = API_BASE + '/chat';
-    const PING_URL  = API_BASE + '/ping';
+     
+  const urlParams = new URLSearchParams(location.search);
+
+// Prefer ?api=..., else a global window.API_BASE, else your HTTPS domain.
+  const API_BASE = (
+    urlParams.get('api') ||
+    window.API_BASE ||
+    'https://api.corvox.co.uk/api'
+  ).replace(/\/+$/, '');
+
+  const HEALTH_URL = API_BASE + '/health';
+  const CHAT_URL   = API_BASE + '/chat';
+  const PING_URL   = API_BASE + '/ping';
+// ---------------------------------------------------------------
 
     // Inactivity knobs (frontend hint; backend is source of truth)
     const INACTIVITY_MINUTES = 5;

@@ -1,501 +1,92 @@
 # app/lead/capture.py
 from __future__ import annotations
-
-import os
 import re
-import json
-from datetime import datetime, timezone
-from typing import Optional, Tuple, Dict, Any
+from typing import Dict, Optional
+from app.core.session_mem import get_session, update_session
 
-from app.core.config import (
-    REQUIRE_COMPANY,
-    REQUIRE_EMAIL_OR_PHONE,
-    RECAP_BEFORE_SAVE,
-    END_SESSION_ON_SAVE,
-)
-from app.core.session_mem import (
-    get_state,
-    set_state,
-    mark_asked,
-    recently_asked,
-    update_summary,
-    set_lead_backup,     # Phase 2
-)
-from app.retrieval.leads import mark_stage, mark_done
+# ---- Lead field extractors ----
+_EMAIL_RE = re.compile(r"[\w\.-]+@[\w\.-]+\.\w+", re.IGNORECASE)
+_PHONE_RE = re.compile(r"\+?\d[\d\s\-]{7,}\d")
+_NAME_RE = re.compile(r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)\b")
+_COMPANY_RE = re.compile(r"(?:company|business|organisation|organization)\s*(?:name|called|is)?\s*([A-Z][\w&\s]+)", re.IGNORECASE)
+_TIME_RE = re.compile(r"(\b\d{1,2}\s*(?:am|pm|a\.m\.|p\.m\.)\b|\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b)", re.IGNORECASE)
 
-# ===== LLM fallback config (for name only; conservative) =====
-_OPENAI_MODEL = os.getenv("OPENAI_EXTRACT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
-_NAME_LLM_MIN_CONF = float(os.getenv("NAME_LLM_MIN_CONF", "0.92"))
+# ---- Ask gating ----
+ASK_INTERVAL_TURNS = 2  # at least 2 turns between new asks
 
-_client = None
-def _get_client():
-    global _client
-    if _client is None:
-        try:
-            from openai import OpenAI  # type: ignore
-            _client = OpenAI()
-        except Exception:
-            _client = False
-    return _client
+def extract_lead_fields(text: str) -> Dict[str, str]:
+    """Extract name, email, phone, company, and time from user text."""
+    lead: Dict[str, str] = {}
+    if m := _EMAIL_RE.search(text):
+        lead["email"] = m.group(0).strip()
+    if m := _PHONE_RE.search(text):
+        lead["phone"] = m.group(0).strip()
+    if m := _COMPANY_RE.search(text):
+        lead["company"] = m.group(1).strip()
+    if m := _TIME_RE.search(text):
+        lead["time"] = m.group(1).strip()
+    # name as a fallback if context allows (avoid false positives)
+    if not lead.get("name") and "my name" in text.lower():
+        possible = re.sub(r"^.*my name is\s*", "", text, flags=re.I)
+        lead["name"] = possible.split()[0].strip().title()
+    return lead
 
-# ===== Fast extractors =====
-EMAIL_RE  = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
-PHONE_RE  = re.compile(r"(\+?\d[\d\s().-]{7,}\d)")
-NAME_RE   = re.compile(
-    r"\b(i'?m|i am|this is|my name is|name is|name\s*:|it'?s)\s+([A-Za-z][A-Za-z\-\' ]{1,40})",
-    re.I,
-)
 
-# Time heuristics: very light, safe to accept as a user preference text
-DAY_WORDS = r"(mon|tue|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today)"
-TIME_RE = re.compile(
-    rf"\b({DAY_WORDS}(?:\s+at|\s+around|\s+by)?\s*\d{{1,2}}(?::\d{{2}})?\s*(?:am|pm)?)\b"
-    r"|(\bany ?time\b|\bmorning\b|\bafternoon\b|\bevening\b|\b3-5 ?pm\b|\b\d{1,2}\s*-\s*\d{1,2}\s*(?:am|pm)\b)",
-    re.I,
-)
+def update_lead_info(session_id: str, text: str) -> Dict[str, str]:
+    """Update session lead data from user text."""
+    session = get_session(session_id)
+    new_fields = extract_lead_fields(text)
+    session["lead"].update(new_fields)
+    update_session(session_id, session)
+    return session["lead"]
 
-COMPANY_RE = re.compile(
-    r"\b(?:my\s+(?:company|business|store|shop)\s+(?:is|called|name(?:d)?\s+is)\s+)([A-Za-z0-9&\-' ]{2,64})",
-    re.I
-)
 
-_STOP_WORDS = {
-    "hi","hello","hey","ok","okay","thanks","thank","please",
-    "email","phone","number","call","start","begin","book","callme",
-    "price","pricing","cost","whatsapp","chatbot","bot","website","address",
-    "yes","yep","yeah","no","nope","what","why","how","when","where","who","can","could",
-    "would","does","do","help","service",
-}
+def next_lead_question(session_id: str, turn_idx: int, user_intent: str = "") -> Optional[str]:
+    """
+    Return the next lead-capture question, or None if we shouldn’t ask yet.
+    Gating logic ensures we don't interrogate too soon or repeat.
+    """
+    s = get_session(session_id)
+    lead = s.get("lead", {})
+    last_asked = s.get("last_asked_field")
+    last_ask_turn = s.get("last_ask_turn", -ASK_INTERVAL_TURNS)
 
-def harvest_email(text: str) -> Optional[str]:
-    m = EMAIL_RE.search(text or "")
-    return m.group(0) if m else None
-
-def harvest_phone(text: str) -> Optional[str]:
-    m = PHONE_RE.search(text or "")
-    return m.group(0).strip() if m else None
-
-def harvest_company(text: str) -> Optional[str]:
-    m = COMPANY_RE.search(text or "")
-    if m:
-        return " ".join(m.group(1).split()).strip()
-    return None
-
-def harvest_time(text: str) -> Optional[str]:
-    t = (text or "").strip()
-    if not t:
+    # Too soon? Wait at least ASK_INTERVAL_TURNS since last ask.
+    if turn_idx - last_ask_turn < ASK_INTERVAL_TURNS:
         return None
-    m = TIME_RE.search(t)
-    if m:
-        val = (m.group(1) or m.group(2) or "").strip()
-        return re.sub(r"\s+", " ", val).lower()
-    # simple “tuesday 11am?” split forms
-    if re.search(DAY_WORDS, t, re.I) and re.search(r"\b\d{1,2}\s*(?:am|pm)\b", t, re.I):
-        return re.sub(r"\s+", " ", t).lower()
-    # catch “anytime” etc
-    if re.search(r"\bany ?time\b|\bmorning\b|\bafternoon\b|\bevening\b", t, re.I):
-        return re.sub(r"\s+", " ", t).lower()
-    return None
 
-def _normalize_person_name(raw: str) -> str:
-    raw = (raw or "").strip()
-    parts = re.split(r"\s+", raw)
-    fixed = []
-    for p in parts:
-        if not p:
-            continue
-        fixed.append(p[:1].upper() + p[1:].lower())
-    return " ".join(fixed)
-
-def _starts_with_interrogative(s: str) -> bool:
-    s = (s or "").lstrip().lower()
-    for w in ("what","why","how","when","where","who","can","could","would","does","do","please","thanks"):
-        if s.startswith(w + " "):
-            return True
-    return False
-
-def _contains_contactish(s: str) -> bool:
-    sl = (s or "").lower()
-    if any(tok in sl for tok in ("number", "phone", "email", "call", "time", "am", "pm", "@", "http", "https", "whatsapp")):
-        return True
-    if any(ch.isdigit() for ch in sl):
-        return True
-    return False
-
-def _looks_like_person_name(s: str) -> bool:
-    if not s:
-        return False
-    s = s.strip()
-    if len(s) < 2 or len(s) > 40:
-        return False
-    if _contains_contactish(s):
-        return False
-    if _starts_with_interrogative(s):
-        return False
-    tokens = [t for t in re.split(r"\s+", s) if t]
-    if not (1 <= len(tokens) <= 4):
-        return False
-    sw = sum(1 for t in tokens if t.lower() in _STOP_WORDS)
-    if sw >= max(1, len(tokens) - 1):
-        return False
-    if not all(re.fullmatch(r"[A-Za-z][A-Za-z\-']*", t) for t in tokens):
-        return False
-    return True
-
-def _llm_extract_name(text: str) -> Tuple[Optional[str], float]:
-    cli = _get_client()
-    if not cli:
-        return None, 0.0
-    system = (
-        "Extract exactly one PERSON's name from the user's latest message. "
-        "Return compact JSON: {\"name\": string|null, \"confidence\": number}. "
-        "If none, use null + confidence 0."
-    )
-    user = f"User message:\n{text or ''}\n"
-    try:
-        resp = cli.chat.completions.create(
-            model=_OPENAI_MODEL,
-            temperature=0.0,
-            messages=[
-                {"role":"system","content":system},
-                {"role":"user","content":user},
-            ],
-        )
-        out = (resp.choices[0].message.content or "").strip()
-        data = None
-        try:
-            data = json.loads(out)
-        except Exception:
-            m = re.search(r"\{.*\}", out, re.DOTALL)
-            if m:
-                data = json.loads(m.group(0))
-        if isinstance(data, dict):
-            nm = (data.get("name") or "").strip() or None
-            conf = float(data.get("confidence") or 0.0)
-            return nm, conf
-    except Exception:
-        pass
-    return None, 0.0
-
-def harvest_name(text: str) -> Optional[str]:
-    t = (text or "").strip()
-    m = NAME_RE.search(t)
-    if m:
-        raw = m.group(2).strip()
-        nm = _normalize_person_name(raw)
-        if _looks_like_person_name(nm):
-            return nm
-    tokens = [tok for tok in t.split() if tok]
-    if 1 <= len(tokens) <= 4 and all(re.fullmatch(r"[A-Za-z][A-Za-z\-']*", tok) for tok in tokens):
-        nm = _normalize_person_name(t)
-        if _looks_like_person_name(nm):
-            return nm
-    nm, conf = _llm_extract_name(t)
-    if nm and conf >= _NAME_LLM_MIN_CONF:
-        nm = _normalize_person_name(nm)
-        if _looks_like_person_name(nm):
-            return nm
-    return None
-
-# ===== Flow helpers =====
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def _is_affirmative(s: str) -> bool:
-    s = (s or "").strip().lower()
-    return s in {"yes","yep","yeah","correct","confirm","that's right","thats right","ok","okay","sure","please do","go ahead","sounds good"}
-
-def in_progress(session_id: str) -> bool:
-    st = get_state(session_id)
-    stage = (st or {}).get("lead_stage")
-    return bool(stage and stage != "done")
-
-def start(session_id: str, kind: str = "callback") -> Dict[str, str]:
-    st = get_state(session_id) or {}
-    if st.get("lead_stage") == "done":
-        return {"hint":"after_done"}
-    set_state(session_id, lead_stage="name", lead_started_at=_now_iso())
-    mark_stage(session_id, stage="name", source=kind)
-    # first ask (with cooldown guard)
-    if not recently_asked(session_id, "name", cooldown_sec=45):
-        mark_asked(session_id, "name")
-        return {"hint":"ask_name"}
-    return {"hint":"bridge_back_to_name"}
-
-def _maybe_update_name_from(text: str, session_id: str) -> Optional[str]:
-    t = (text or "").strip()
-    if not t or _contains_contactish(t):
+    # Determine missing fields in order of importance
+    missing = [f for f in ["name", "company", "email", "phone", "time"] if not lead.get(f)]
+    if not missing:
         return None
-    has_cue = bool(NAME_RE.search(t))
-    tokens = [tok for tok in t.split() if tok]
-    pure_short = 1 <= len(tokens) <= 3 and all(re.fullmatch(r"[A-Za-z][A-Za-z\-']*", tok) for tok in tokens)
-    if not (has_cue or pure_short):
+
+    # Trigger only if user shows intent (pricing/demo/contact etc.) or conversation matured
+    if not user_intent and turn_idx < 3:
         return None
-    new_name = harvest_name(t)
-    if not new_name:
-        return None
-    st = get_state(session_id) or {}
-    if st.get("name") != new_name:
-        set_state(session_id, name=new_name)
-        mark_stage(session_id, stage=(st.get("lead_stage") or "name"), name=new_name)
-        update_summary(session_id)
-        return new_name
-    return None
 
-def _maybe_update_company_from(text: str, session_id: str) -> Optional[str]:
-    comp = harvest_company(text or "")
-    if comp:
-        st = get_state(session_id) or {}
-        if (st.get("company") or "").strip().lower() != comp.lower():
-            set_state(session_id, company=comp)
-            update_summary(session_id)
-            return comp
-    return None
+    next_field = missing[0]
 
-def _ensure_contact_in_state(session_id: str, text: str) -> None:
-    em = harvest_email(text)
-    ph = harvest_phone(text)
-    updates = {}
-    if em: updates["email"] = em
-    if ph: updates["phone"] = ph
-    if updates:
-        set_state(session_id, **updates)
-        mark_stage(session_id, stage=get_state(session_id).get("lead_stage") or "contact", **updates)
-        update_summary(session_id)
-
-def _ensure_time_in_state(session_id: str, text: str) -> None:
-    pref = harvest_time(text or "")
-    if pref:
-        set_state(session_id, preferred_time=pref)
-        mark_stage(session_id, stage=get_state(session_id).get("lead_stage") or "time", preferred_time=pref)
-        update_summary(session_id)
-
-def _build_lead_report(st: Dict[str, Any]) -> Dict[str, Any]:
-    # very small inference; keep it robust
-    interest = "high" if st.get("phone") or st.get("email") else "medium"
-    quality  = 2 if interest == "high" else 1
-    topic = st.get("current_topic") or "not_set"
-    company = st.get("company") or "not_set"
-    notes = st.get("notes") or None
-    when = st.get("preferred_time") or "unspecified"
-    name = st.get("name") or "unknown"
-
-    return {
-        "summary": f"{name} ({company}) asked about {topic}; prefers time: {when}.",
-        "interest_level": interest,
-        "lead_quality": quality,            # 0..3
-        "next_action": "schedule_callback" if (st.get("phone") or st.get("email")) else "nurture_email",
-        "channel": "chat",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "details": {
-            "name": st.get("name"),
-            "company": company,
-            "phone": st.get("phone"),
-            "email": st.get("email"),
-            "preferred_time": st.get("preferred_time"),
-            "topic": topic,
-            "user_notes": notes,
-        },
+    prompts = {
+        "name": "May I have your name, please?",
+        "company": "Could you tell me your company name?",
+        "email": "What’s the best email address to reach you?",
+        "phone": "Could you share your contact number?",
+        "time": "When would be a convenient time for a quick call?",
     }
 
-# ===== Main controller =====
+    s["last_asked_field"] = next_field
+    s["last_ask_turn"] = turn_idx
+    update_session(session_id, s)
+    return prompts[next_field]
 
-def take_turn(session_id: str, text: str) -> Dict[str, str]:
-    """
-    State machine (signals only).
-    Stages: name -> contact -> time -> notes -> confirm -> done
-    Finalize requires:
-      - name present
-      - (email or phone) present
-      - company present if REQUIRE_COMPANY = True
-    Time is optional.
-    """
-    st = get_state(session_id) or {}
-    stage = st.get("lead_stage") or "name"
 
-    # opportunistic harvests every turn (support corrections)
-    _maybe_update_company_from(text, session_id)
-    _ensure_contact_in_state(session_id, text)
-    _ensure_time_in_state(session_id, text)
-    _maybe_update_name_from(text, session_id)
-
-    # normalise stage
-    if stage not in {"name", "contact", "time", "notes", "confirm", "done"}:
-        stage = "name"
-        set_state(session_id, lead_stage="name")
-
-    # --- NAME ---
-    if stage == "name":
-        nm = harvest_name(text) or st.get("name")
-        if nm:
-            set_state(session_id, name=nm, lead_stage="contact")
-            mark_stage(session_id, stage="contact", name=nm, source="chat")
-            update_summary(session_id)
-            if not recently_asked(session_id, "contact", 45):
-                mark_asked(session_id, "contact")
-                return {"hint":"ask_contact"}
-            return {"hint":"bridge_back_to_contact"}
-        # ask (or bridge) name
-        if not recently_asked(session_id, "name", 45):
-            mark_asked(session_id, "name")
-            return {"hint":"ask_name"}
-        return {"hint":"bridge_back_to_name"}
-
-    # --- CONTACT ---
-    if stage == "contact":
-        st_now = get_state(session_id) or {}
-        if st_now.get("phone") or st_now.get("email"):
-            # also ensure company if required; ask gently
-            if REQUIRE_COMPANY and not (st_now.get("company") or "").strip():
-                if not recently_asked(session_id, "company", 45):
-                    mark_asked(session_id, "company")
-                    return {"hint":"ask_company"}
-                return {"hint":"bridge_back_to_company"}
-            # then move on
-            set_state(session_id, lead_stage="time")
-            mark_stage(session_id, stage="time")
-            update_summary(session_id)
-            # If time already present, advance to notes straight away.
-            st_now2 = get_state(session_id) or {}
-            if st_now2.get("preferred_time"):
-                set_state(session_id, lead_stage="notes")
-                mark_stage(session_id, stage="notes")
-                update_summary(session_id)
-                if not recently_asked(session_id, "notes", 45):
-                    mark_asked(session_id, "notes")
-                    return {"hint":"ask_notes"}
-                return {"hint":"bridge_back_to_notes"}
-            # else ask/bridge time
-            if not recently_asked(session_id, "time", 45):
-                mark_asked(session_id, "time")
-                return {"hint":"ask_time"}
-            return {"hint":"bridge_back_to_time"}
-
-        # need contact
-        if not recently_asked(session_id, "contact", 45):
-            mark_asked(session_id, "contact")
-            return {"hint":"ask_contact"}
-        return {"hint":"bridge_back_to_contact"}
-
-    # --- TIME (optional, but helpful) ---
-    if stage == "time":
-        st_now = get_state(session_id) or {}
-        pref = st_now.get("preferred_time") or harvest_time(text or "")
-        if pref:
-            set_state(session_id, preferred_time=pref, lead_stage="notes")
-            mark_stage(session_id, stage="notes", preferred_time=pref)
-            update_summary(session_id)
-            if not recently_asked(session_id, "notes", 45):
-                mark_asked(session_id, "notes")
-                return {"hint":"ask_notes"}
-            return {"hint":"bridge_back_to_notes"}
-        # ask/bridge time again with cooldown
-        if not recently_asked(session_id, "time", 45):
-            mark_asked(session_id, "time")
-            return {"hint":"ask_time"}
-        return {"hint":"bridge_back_to_time"}
-
-    # --- NOTES -> CONFIRM (Phase 2 recap gate) ---
-    if stage == "notes":
-        # save user notes if present
-        user_notes = (text or "").strip()
-        if user_notes:
-            set_state(session_id, notes=user_notes)
-            update_summary(session_id)
-
-        # gate: require name and contact; company if required
-        st_now = get_state(session_id) or {}
-        has_name = bool(st_now.get("name"))
-        has_contact = bool(st_now.get("phone") or st_now.get("email"))
-        has_company = bool((st_now.get("company") or "").strip()) if REQUIRE_COMPANY else True
-
-        if not has_name:
-            if not recently_asked(session_id, "name", 45):
-                mark_asked(session_id, "name")
-                return {"hint":"ask_name"}
-            return {"hint":"bridge_back_to_name"}
-
-        if not has_contact:
-            if not recently_asked(session_id, "contact", 45):
-                mark_asked(session_id, "contact")
-                return {"hint":"ask_contact"}
-            return {"hint":"bridge_back_to_contact"}
-
-        if not has_company:
-            if not recently_asked(session_id, "company", 45):
-                mark_asked(session_id, "company")
-                return {"hint":"ask_company"}
-            return {"hint":"bridge_back_to_company"}
-
-        # Ready to recap
-        report = _build_lead_report(st_now)
-        set_lead_backup(session_id, report)
-        set_state(session_id, lead_stage="confirm")
-        return {"hint":"recap_confirm"}  # generator should read back details and ask to confirm/correct
-
-    # --- CONFIRM (save on affirmative, re-recap on corrections) ---
-    if stage == "confirm":
-        # Opportunistic corrections still apply above; by now state reflects last user turn.
-        st_now = get_state(session_id) or {}
-        has_name = bool(st_now.get("name"))
-        has_contact = bool(st_now.get("phone") or st_now.get("email"))
-        has_company = bool((st_now.get("company") or "").strip()) if REQUIRE_COMPANY else True
-
-        # If any mandatory field is missing (e.g., user removed during correction), bounce back to that
-        if not has_name:
-            return {"hint":"bridge_back_to_name"}
-        if not has_contact:
-            return {"hint":"bridge_back_to_contact"}
-        if not has_company:
-            return {"hint":"bridge_back_to_company"}
-
-        # If user clearly affirms, save
-        if _is_affirmative(text):
-            report = _build_lead_report(st_now)
-            merged_notes = report
-            user_notes = (st_now.get("notes") or "").strip()
-            if user_notes:
-                merged_notes["details"]["user_notes"] = user_notes
-
-            now_iso = _now_iso()
-            try:
-                mark_stage(
-                    session_id,
-                    stage="done",
-                    name=st_now.get("name"),
-                    phone=st_now.get("phone"),
-                    email=st_now.get("email"),
-                    preferred_time=st_now.get("preferred_time"),
-                    notes=json.dumps(merged_notes),
-                )
-                mark_done(
-                    session_id,
-                    name=st_now.get("name"),
-                    phone=st_now.get("phone"),
-                    email=st_now.get("email"),
-                    preferred_time=st_now.get("preferred_time"),
-                    notes=json.dumps(merged_notes),
-                    done_at=now_iso,
-                )
-                set_state(session_id, lead_stage="done", lead_done_at=now_iso, lead_just_done=True)
-                update_summary(session_id)
-                if END_SESSION_ON_SAVE:
-                    set_state(session_id, end_session=True)
-                return {"hint":"confirm_done"}
-            except Exception:
-                # If DB upsert fails, ask to confirm contact again (soft recovery)
-                return {"hint":"bridge_back_to_contact"}
-
-        # Not an explicit yes: either corrections came in or user is ambiguous → re-issue recap
-        # (opportunistic harvest above already updated state if corrections were typed)
-        report = _build_lead_report(st_now)
-        set_lead_backup(session_id, report)
-        return {"hint":"recap_confirm"}
-
-    # --- DONE ---
-    if stage == "done":
-        return {"hint":"after_done"}
-
-    # Fallback
-    return {"hint":"ask_name"}
+def summarize_lead(session_id: str) -> str:
+    """Compact one-line summary for reporting or closure."""
+    lead = get_session(session_id).get("lead", {})
+    parts = []
+    if n := lead.get("name"): parts.append(n)
+    if c := lead.get("company"): parts.append(f"({c})")
+    if e := lead.get("email"): parts.append(f"📧 {e}")
+    if p := lead.get("phone"): parts.append(f"📞 {p}")
+    if t := lead.get("time"): parts.append(f"🕒 {t}")
+    return " ".join(parts) if parts else "—"

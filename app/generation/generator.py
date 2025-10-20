@@ -198,6 +198,12 @@ def generate_answer(
     kind = plan.get("kind","qa")
     needs_retrieval = bool(plan.get("needs_retrieval", True))
 
+    # Pricing sanity & pivot
+    from app.lead.pricing import maybe_add_pricing_context
+    pricing_reply = maybe_add_pricing_context(session_id="web", text=user_text)
+    if pricing_reply:
+        return {"answer": pricing_reply, "citations": None, "debug": {"planner": plan, "num_hits": 0}}
+
     # NEW: nudge the generator when user directly asked about pricing
     # (Don’t change DB state here — this is UI/LLM-level behaviour only.)
     if not lead_hint and _PRICING_RE.search(user_text or ""):
