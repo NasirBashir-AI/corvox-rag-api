@@ -104,6 +104,8 @@ def _planner(user_text: str, lead_hint: str = "", current_topic: str = "") -> Di
     # Default fallback: basic QA with retrieval
     return {"kind": "qa", "needs_retrieval": True, "search_query": user_text, "lead_prompt": None}
 
+# inside app/generation/generator.py
+
 def _final_answer(
     model: str,
     user_text: str,
@@ -117,47 +119,18 @@ def _final_answer(
     lead_hint: str,
     last_asked: str,
 ) -> str:
-    # ---- System rules (Phase 2.2 behavioural guard) ----
     system = (
-        "You are Corah, Corvox’s warm front-desk assistant—polite, concise, genuinely helpful.\n"
-        "Help-first rule: Always answer the user's question before asking for contact details. "
-        "Only ask for name, company, or contact if the user shows sales intent "
-        "(pricing, demo, quote, trial, contact), or after 2–3 turns. "
-        "Never insist on a discovery call before helping.\n"
-        "Conversation priorities (strict):\n"
-        "A) If lead capture is incomplete (missing name OR missing contact (email/phone) OR missing company), "
-        "   prefer asking for exactly ONE missing item that most advances scheduling a discovery call.\n"
-        "B) If user asked for pricing/cost, give a short, safe statement (no hard numbers or rigid 'tiers') and pivot with ONE brief ask.\n"
-        "C) If lead is complete or user says 'no/that’s all/bye', summarise once and close politely.\n"
-        "\n"
-        "Behavioural rules:\n"
-        "1) Keep replies short (1–3 sentences). Avoid filler.\n"
-        "2) Ask at most ONE question only when it advances A/B above. Otherwise use a statement.\n"
-        "3) Use [Summary], [Current topic], and [Recent turns] to stay on the SAME thread; do NOT re-ask known details.\n"
-        "4) Hallucination guard: do NOT invent prices/timelines/features; if info is missing, say so and propose a short discovery call.\n"
-        "5) Brand: Corvox BUILDS custom chat + voice agents (Corah). Do NOT imply we only integrate third-party chatbots.\n"
-        "6) Third-party tools: only mention external plugins if the user explicitly asks for third-party options; otherwise prefer Corah.\n"
-        "7) If last_asked equals the current ask target, do NOT repeat; briefly acknowledge and move to the next most useful step.\n"
-        "8) If user declines to share contact, respect it; continue helping without nagging.\n"
-        "9) When the user says 'no', 'that’s all', or 'bye', summarise once, thank politely, then close the chat (no further questions).\n"
-    )
-
-    # Minimal few-shot to anchor “continue same topic” without re-asking
-    shots = (
-        "Example A\n"
-        "[Summary] user exploring chatbot for a toy store; wants stock updates.\n"
-        "User: yes, tell me more\n"
-        "Assistant: We can connect inventory to answer “in stock?” in real time and suggest alternatives. "
-        "If you like, I can set a quick discovery call—what's your name and the best email?\n\n"
-        "Example B\n"
-        "[Summary] user just asked about pricing.\n"
-        "User: how much\n"
-        "Assistant: Pricing depends on scope; we start with a short discovery call, then share a clear quote. "
-        "Shall I note your name and email to arrange it?\n\n"
+        "You are Corah, Corvox’s warm front-desk assistant — helpful first, concise, factual.\n"
+        "Rules:\n"
+        "• Always answer the user’s question before any lead capture.\n"
+        "• Never ask for a field that is already known in [Lead slots].\n"
+        "• At most one short question when it clearly advances the conversation.\n"
+        "• If a name exists in [Lead slots], use it naturally once (e.g., “Thanks, Nasir”).\n"
+        "• Do not invent pricing; you may offer to arrange a call if the user asks for price specifics.\n"
+        "• If the user declines sharing contact, keep helping without nagging.\n"
     )
 
     user = (
-        f"{shots}"
         f"User: {user_text}\n\n"
         f"[Summary]\n{summary or 'None'}\n\n"
         f"[Current topic]\n{current_topic or 'None'}\n\n"
@@ -166,9 +139,8 @@ def _final_answer(
         f"[Company contact]\n{contact_ctx or 'None'}\n\n"
         f"[Pricing]\n{pricing_ctx or 'None'}\n\n"
         f"[Retrieved]\n{retrieved_snippets or 'None'}\n\n"
-        f"[Lead hint]\n{lead_hint or 'None'}\n\n"
-        f"[last_asked]\n{last_asked or 'None'}\n\n"
-        "Now reply as Corah following the rules above."
+        f"[Lead slots]  # dict of known lead fields; do NOT ask again if present\n{getattr(__import__('json'), 'dumps')({'placeholder':'moved to main context'}, indent=2)}\n\n"
+        "Reply now as Corah following the rules."
     )
     return _chat(model, system, user, temperature=_FINAL_TEMP)
 
