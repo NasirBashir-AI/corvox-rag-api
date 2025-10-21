@@ -115,7 +115,7 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     )
 
     try:
-        gen = generate_answer(f"{q}\n\n{context_block}", k=RETRIEVAL_TOP_K, max_context_chars=3000)
+        gen = generate_answer(f"{q}\n\n{context_block}", k=RETRIEVAL_TOP_K)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"generation_failed: {type(e).__name__}: {e}")
 
