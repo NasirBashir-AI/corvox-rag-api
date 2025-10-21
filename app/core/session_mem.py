@@ -2,7 +2,7 @@
 """
 Lightweight in-memory session manager for Corah.
 Persists recent turns, summary, and lead slots per session.
-Phase 2.1: adds slot authority, CTA cooldown, and safe resets.
+Phase 2.1+: adds slot authority, CTA cooldown, safe resets, and closure helpers.
 """
 
 from __future__ import annotations
@@ -10,13 +10,13 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 
 # ---------------------------------------------------------------------
-# In-memory store (temporary; in production this can be Redis)
+# In-memory store (temporary; in production use Redis)
 # ---------------------------------------------------------------------
 _SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 TURN_MEMORY_LIMIT = 10
-CTA_COOLDOWN_TURNS = 2     # at least 2 assistant turns before next CTA
-SESSION_TTL_MINUTES = 30   # stale cleanup window
+CTA_COOLDOWN_TURNS = 2      # at least 2 assistant/user turns between CTAs
+SESSION_TTL_MINUTES = 30    # stale cleanup window
 
 # ---------------------------------------------------------------------
 # Core helpers
@@ -25,7 +25,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def get_state(session_id: str) -> Optional[Dict[str, Any]]:
-    """Return current session dict."""
+    """Return current session dict (or None)."""
     return _SESSIONS.get(session_id)
 
 def set_state(session_id: str, **fields: Any) -> None:
@@ -60,19 +60,24 @@ def recent_turns(session_id: str, n: int = 6) -> List[Dict[str, Any]]:
 # Summary + topic tracking
 # ---------------------------------------------------------------------
 def update_summary(session_id: str) -> None:
-    """Light heuristic summary (can later be LLM-generated)."""
+    """
+    Light heuristic summary (safe if no LLM summarizer is wired).
+    - Writes BOTH 'summary' (what main.py reads) and 'session_summary' (legacy).
+    """
     st = _SESSIONS.setdefault(session_id, {})
     turns = st.get("turns", [])
     if not turns:
         return
     # take last user message for quick summary
-    last_user = next((t["content"] for t in reversed(turns) if t["role"] == "user"), "")
-    st["session_summary"] = (last_user[:150] + "...") if last_user else "-"
+    last_user = next((t["content"] for t in reversed(turns) if t.get("role") == "user"), "")
+    quick = (last_user[:150] + "...") if last_user and len(last_user) > 150 else (last_user or "-")
+    st["summary"] = quick                 # <- main.py expects this
+    st["session_summary"] = quick         # <- keep legacy key for safety
     st["current_topic"] = st.get("current_topic") or "general"
     st["updated_at"] = _now_iso()
 
 # ---------------------------------------------------------------------
-# Lead slot management (Phase 2.1)
+# Lead slot management
 # ---------------------------------------------------------------------
 def get_lead_slots(session_id: str) -> Dict[str, Any]:
     st = _SESSIONS.setdefault(session_id, {})
@@ -85,13 +90,15 @@ def get_lead_slots(session_id: str) -> Dict[str, Any]:
         "notes": None,
     })
 
-def update_lead_slot(session_id: str, field: str, value: str) -> None:
+def update_lead_slot(session_id: str, field: str, value: Optional[str]) -> None:
     st = _SESSIONS.setdefault(session_id, {})
     lead = get_lead_slots(session_id)
-    if value and (lead.get(field) != value):
-        lead[field] = value.strip()
-        st["last_slot_updated"] = field
-        st["updated_at"] = _now_iso()
+    if value:
+        v = value.strip()
+        if v and (lead.get(field) != v):
+            lead[field] = v
+            st["last_slot_updated"] = field
+            st["updated_at"] = _now_iso()
 
 def all_lead_info_complete(session_id: str) -> bool:
     lead = get_lead_slots(session_id)
@@ -118,6 +125,7 @@ def reset_cta_cooldown(session_id: str) -> None:
     st = _SESSIONS.setdefault(session_id, {})
     st["cta_last_turn"] = 0
     st["cta_attempts"] = 0
+    st["updated_at"] = _now_iso()
 
 # ---------------------------------------------------------------------
 # Session lifecycle (closure + expiry)
@@ -129,11 +137,21 @@ def mark_closed(session_id: str) -> None:
     st["is_closed"] = True
     st["updated_at"] = _now_iso()
 
+def is_session_closed(session_id: str) -> bool:
+    st = _SESSIONS.get(session_id, {})
+    return bool(st.get("is_closed"))
+
 def cleanup_expired() -> None:
     """Remove old sessions beyond TTL."""
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=SESSION_TTL_MINUTES)
-    stale = [sid for sid, s in _SESSIONS.items()
-             if datetime.fromisoformat(s.get("updated_at", _now_iso())) < cutoff]
+    stale = []
+    for sid, s in _SESSIONS.items():
+        try:
+            ts = datetime.fromisoformat(s.get("updated_at", _now_iso()))
+        except Exception:
+            ts = now
+        if ts < cutoff:
+            stale.append(sid)
     for sid in stale:
         del _SESSIONS[sid]

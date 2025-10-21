@@ -1,19 +1,19 @@
+# app/retrieval/retriever.py
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
 from app.core.config import DB_URL, RETRIEVAL_TOP_K
 from app.core.utils import pg_cursor, rows_to_dicts
 from app.retrieval.scoring import hybrid_retrieve
 from app.retrieval.sql import SQL_FACTS_SELECT_BY_NAMES
-
-# app/retrieval/retriever.py
 
 """
 Thin retrieval facade used by the API and generator.
 
 - search(query, k)      -> top-k hybrid retrieval hits (vector + FTS)
 - get_facts(names)      -> structured facts for contact/pricing
-- top_similarity(hits)  -> best score across hits (compat for generator)
-- make_context(hits)    -> join hits into a single context string (compat)
+- top_similarity(hits)  -> best score across hits
+- make_context(hits)    -> join hits into a single context string (+ citations)
 """
 
 # -----------------------------
@@ -41,16 +41,12 @@ def get_facts(names: Sequence[str], db_url: Optional[str] = None) -> Dict[str, s
 
     # De-duplicate & keep order stable
     uniq = list(dict.fromkeys([n for n in names if n]))
-
     if not uniq:
         return {}
 
-    with pg_cursor(db_url) as cur:
-        # SQL_FACTS_SELECT_BY_NAMES should be like:
-        #   SELECT name, value, uri, updated_at
-        #   FROM corah_store.facts
-        #   WHERE name = ANY(%s)
-        #   ORDER BY name;
+    # IMPORTANT: default to DB_URL if caller didn't pass one
+    with pg_cursor(db_url or DB_URL) as cur:
+        # SQL should be parameterized with %(names)s
         cur.execute(SQL_FACTS_SELECT_BY_NAMES, {"names": uniq})
         rows: List[Dict[str, Any]] = rows_to_dicts(cur)
 
@@ -80,28 +76,36 @@ def make_context(
     """
     Join hits into a single context string and also return lightweight citations.
     Returns: (context_text, citations or None)
+
+    Each citation item uses keys aligned with the API schema:
+      {"title": <str>, "source_uri": <str>}
     """
     parts: List[str] = []
     citations: List[Dict[str, str]] = []
 
+    used = 0
     for i, h in enumerate(hits, 1):
         title = h.get("title") or f"Document {h.get('document_id', i)}"
-        content = h.get("content") or ""
+        content = (h.get("content") or "").strip()
         source = (h.get("source_uri") or "").strip()
+
+        if not content:
+            continue
 
         block = f"## {title}\n{content}"
         if source:
             block += f"\n\n(SOURCE: {source})"
-            citations.append({"title": title, "uri": source})
+            citations.append({"title": title, "source_uri": source})
 
-        parts.append(block.strip())
-
-        # stop when we’re at/over the budget
-        if sum(len(p) for p in parts) >= max_chars:
+        if used + len(block) > max_chars:
+            # take a clipped slice if nothing has been added yet
+            if not parts:
+                block = block[: max_chars - 1].rstrip() + "…"
+                parts.append(block)
             break
 
-    ctx = "\n\n---\n\n".join(parts).strip()
-    if len(ctx) > max_chars:
-        ctx = ctx[: max_chars - 1].rstrip() + "…"
+        parts.append(block)
+        used += len(block)
 
+    ctx = "\n\n---\n\n".join(parts).strip()
     return ctx, (citations if citations else None)

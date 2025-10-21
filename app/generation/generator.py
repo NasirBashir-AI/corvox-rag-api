@@ -16,33 +16,29 @@ from app.retrieval.retriever import search
 _PLANNER_MODEL = os.getenv("OPENAI_PLANNER_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 _FINAL_MODEL   = os.getenv("OPENAI_FINAL_MODEL",   os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 
-# Phase 2: separate planner/final temps; fall back to legacy TEMPERATURE
+# Separate planner/final temps; fall back to legacy TEMPERATURE
 _LEGACY_TEMP   = float(os.getenv("TEMPERATURE", "0.5"))
 _PLANNER_TEMP  = float(os.getenv("PLANNER_TEMPERATURE", os.getenv("PLANNER_TEMP", "0.3")))
 _FINAL_TEMP    = float(os.getenv("FINAL_TEMPERATURE",   os.getenv("FINAL_TEMP",   str(_LEGACY_TEMP))))
 
 _client = OpenAI()
-# Export for lead_intent.py compatibility
-client = _client
+client = _client  # exported compatibility
 
 # ----------------------------
 # Context markers & regex
 # ----------------------------
 _CTX_START = "[Context]"
 _CTX_END   = "[End Context]"
-_LEAD_HINT_RE = re.compile(r"^Lead hint:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
-_LAST_ASKED_RE = re.compile(r"^last_asked\s*:\s*([A-Za-z_]+)\s*$", re.IGNORECASE | re.MULTILINE)
 
-# Terms that should always trigger retrieval (company facts)
+# obvious “company fact” queries that should force retrieval
 _FACT_QUERIES = [
     "address", "where are you based", "where are you located", "location",
     "services", "what services", "pricing", "price", "cost", "how much",
-    "contact", "email", "phone", "number"
+    "contact", "email", "phone", "number", "website", "url"
 ]
 
-
 # ----------------------------
-# Helpers
+# Helpers: context parsing
 # ----------------------------
 def _split_user_and_ctx(q: str) -> Tuple[str, str]:
     if _CTX_START in q and _CTX_END in q:
@@ -51,30 +47,49 @@ def _split_user_and_ctx(q: str) -> Tuple[str, str]:
         return head.strip(), ctx.strip()
     return q.strip(), ""
 
+_SEC_HDR_RE = re.compile(r"^\s*-\s*([A-Za-z][A-Za-z _-]+)\s*:\s*(.*)$", re.IGNORECASE)
+
 def _extract_section(ctx_block: str, header: str) -> str:
+    """
+    Extracts a dash-led section from the [Context] block, e.g.
+      - Summary: ...
+      - Recent turns:
+        <lines>
+    Returns the raw text for that section (may span multiple lines until the next "- <Header>:").
+    """
     if not ctx_block:
         return ""
-    pat = re.compile(rf"-\s*{re.escape(header)}\s*:\s*(.*)", re.IGNORECASE)
-    m = pat.search(ctx_block)
+    # Find the start line for this header (dash style)
+    start_pat = re.compile(rf"^\s*-\s*{re.escape(header)}\s*:\s*(.*)$", re.IGNORECASE | re.MULTILINE)
+    m = start_pat.search(ctx_block)
     if not m:
         return ""
-    start = m.end(0)
-    tail = ctx_block[start:]
+    start_idx = m.end(0)
+    tail = ctx_block[start_idx:]
     nxt = re.search(r"^\s*-\s*[A-Za-z].*?:", tail, re.MULTILINE)
-    chunk = tail[: nxt.start()] if nxt else tail
+    chunk = tail[:nxt.start()] if nxt else tail
     text = (m.group(1) + "\n" + chunk).strip()
     return "\n".join(line.rstrip() for line in text.splitlines()).strip()
 
-def _extract_ctx_bits(ctx: str) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    out["lead_hint"] = ""
-    if ctx:
-        m1 = _LEAD_HINT_RE.search(ctx)
-        if m1:
-            out["lead_hint"] = m1.group(1).strip()
-    m2 = _LAST_ASKED_RE.search(ctx or "")
-    out["last_asked"] = m2.group(1).strip() if m2 else ""
-    return out
+def _extract_intent(ctx_block: str) -> Tuple[str, Optional[str]]:
+    """
+    Parse the [Intent] mini-block your main.py injects:
+      [Intent]
+      kind: info
+      topic: services
+    Returns (kind, topic_or_None)
+    """
+    if not ctx_block:
+        return "other", None
+    # Look for a literal "[Intent]" section; if not present, try to find key lines anyway.
+    # We’ll just scan the whole ctx_block for 'kind:' and 'topic:' lines.
+    m_kind = re.search(r"^\s*kind\s*:\s*([A-Za-z_]+)\s*$", ctx_block, re.IGNORECASE | re.MULTILINE)
+    m_topic = re.search(r"^\s*topic\s*:\s*([A-Za-z_]+)\s*$", ctx_block, re.IGNORECASE | re.MULTILINE)
+    kind = (m_kind.group(1).strip().lower() if m_kind else "other")
+    topic = (m_topic.group(1).strip().lower() if m_topic else None)
+    if topic in ("none", ""):
+        topic = None
+    return kind, topic
 
 def _chat(model: str, system: str, user: str, temperature: float) -> str:
     resp = _client.chat.completions.create(
@@ -85,105 +100,92 @@ def _chat(model: str, system: str, user: str, temperature: float) -> str:
     )
     return (resp.choices[0].message.content or "").strip()
 
-
 # ----------------------------
-# Planner (tight retrieval routing)
+# (Optional) Planner — lightweight/defensive
 # ----------------------------
-def _planner(user_text: str, lead_hint: str = "", current_topic: str = "") -> Dict[str, Any]:
+def _planner(user_text: str, intent_kind: str, intent_topic: Optional[str]) -> Dict[str, Any]:
     """
-    Classifier/planner. Keeps the thread on track and forces KB retrieval for
-    company facts (address/location/services/pricing/contact).
+    We keep a tiny planner for robustness (JSON only).
+    If intent says info/contact/pricing -> retrieval = true.
+    Else leave it to heuristic + explicit fact terms.
     """
+    needs = intent_kind in ("info", "contact") or (intent_kind == "info" and intent_topic in ("pricing", "services"))
     system = (
-        "You are a tiny planner. Return ONLY JSON:\n"
-        "{kind:'qa'|'lead'|'contact'|'pricing'|'follow_up_on_current_topic'|'out_of_scope',"
-        " needs_retrieval:boolean, search_query:string|null, lead_prompt:string|null}\n"
-        "- If the user asks about company facts (address, where based/location, services, pricing/cost/how much, or contact),\n"
-        "  set kind:'qa', needs_retrieval:true, and use the user text as search_query.\n"
-        "- If the user expresses sales intent ('can you build/make', 'interested', 'demo', 'quote', 'trial'),\n"
-        "  or provides phone/email/time, classify as 'lead'.\n"
-        "- Map 'yes/sure/okay/tell me more/go ahead/sounds good' to follow_up_on_current_topic.\n"
-        "- Use 'out_of_scope' for unrelated trivia.\n"
-        "- Set needs_retrieval true only when factual details from KB are needed."
+        "Return ONLY JSON with keys: {needs_retrieval:boolean, search_query:string|null}\n"
+        "- If the user is asking for company facts (address/location/services/pricing/contact), needs_retrieval=true.\n"
+        "- Otherwise false. search_query should usually be the user text."
     )
-    user = (
-        f"User text:\n{user_text}\n\n"
-        f"Lead hint (optional): {lead_hint or 'none'}\n"
-        f"Current topic (if any): {current_topic or 'none'}\n"
-        "Back-channel words to treat as follow-up: yes, sure, ok, okay, go ahead, tell me more, sounds good."
-    )
-
+    user = f"User text:\n{user_text}\n\nHeuristic needs_retrieval (pre): {str(needs).lower()}"
     raw = _chat(_PLANNER_MODEL, system, user, temperature=_PLANNER_TEMP)
+    out = {"needs_retrieval": needs, "search_query": user_text}
     try:
         obj = json.loads(raw)
         if isinstance(obj, dict):
-            return obj
+            out.update({
+                "needs_retrieval": bool(obj.get("needs_retrieval", needs)),
+                "search_query": (obj.get("search_query") or user_text)
+            })
     except Exception:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:
-                pass
-    # Default fallback: basic QA with retrieval
-    return {"kind": "qa", "needs_retrieval": True, "search_query": user_text, "lead_prompt": None}
-
+        pass
+    return out
 
 # ----------------------------
-# Final answer composer (help-first + no-invention)
+# Final answer composer (single authoritative version)
 # ----------------------------
 def _final_answer(
     model: str,
     user_text: str,
     retrieved_snippets: str,
-    user_details: str,
-    contact_ctx: str,
-    pricing_ctx: str,
     summary: str,
     current_topic: str,
     recent_turns: str,
-    lead_hint: str,
-    last_asked: str,
+    user_details: str,
+    contact_ctx: str,
+    pricing_ctx: str,
+    intent_kind: str,
+    intent_topic: Optional[str],
 ) -> str:
-    # Help-first, concise, KB-first, and no invention of company facts
     system = (
-        "You are Corah, Corvox’s warm front-desk assistant—helpful first, concise, factual.\n"
-        "Rules:\n"
-        "- Always answer the user's question before any lead capture.\n"
-        "- Ask at most one short question, only if it clearly advances the goal.\n"
-        "- Never ask for a field that already appears in [User details].\n"
-        "- NEVER invent company facts (address, where based, services, pricing, or contact). "
-        "Use [Retrieved], [Company contact], or [Pricing]; if not present, say you don’t have it in view and offer next steps.\n"
-        "- Respect 'no' (or refusal to share contact) and continue helping without nagging.\n"
-        "- If last_asked equals what you’re about to ask, don’t repeat—move on.\n"
-        "- Pricing: give a safe, short statement (depends on scope; discovery call then quote). No made-up numbers.\n"
-        "- Brand: Corvox BUILDS custom chat + voice agents (Corah). Do NOT imply we only integrate third-party tools.\n"
+        "You are Corah, Corvox’s warm front-desk assistant—help-first, concise, factual.\n"
+        "Hard rules:\n"
+        "1) Answer the user’s question FIRST using [Retrieved] when available.\n"
+        "2) Keep replies short (1–3 sentences). Avoid filler and repetition.\n"
+        "3) Never invent company facts (address/location/services/pricing/contact). "
+        "   If [Retrieved]/[Company contact]/[Pricing] lacks it, say you don’t have it in view and offer a next step.\n"
+        "4) Respect ‘no’ to sharing contact; don’t nag. One brief optional CTA max.\n"
+        "5) Brand: Corvox BUILDS custom chat & voice agents (Corah). Do NOT imply we only integrate third-party tools.\n"
+        "6) If intent kind=info (e.g., services/pricing), give the factual answer first, then at most one soft CTA.\n"
+        "7) If intent kind=contact (email/phone/address/url), only share what’s present in [Retrieved]/[Company contact]. "
+        "   If missing, say you can share via follow-up instead of inventing.\n"
     )
 
-    # Very small, concrete few-shot
     shots = (
-        "Example 1\n"
+        "Example A\n"
         "User: where are you based?\n"
         "[Retrieved] Luton, UK\n"
-        "Assistant: We’re based in Luton, UK. If you’d like more details, I can share contact info or next steps.\n\n"
-        "Example 2\n"
+        "Assistant: We’re based in Luton, UK. If you need anything else, I can point you to the contact page.\n\n"
+        "Example B\n"
         "User: what services do you provide?\n"
-        "[Retrieved] Custom chat and voice agents for support, FAQs, product guidance.\n"
+        "[Retrieved] Custom chat & voice agents for support, FAQs, and product guidance.\n"
         "Assistant: We build custom chat and voice agents—covering support, FAQs, and guided recommendations. "
-        "If you’d like, I can outline an approach for your use case.\n\n"
-        "Example 3\n"
-        "User: what's your address?\n"
-        "[Retrieved] (empty)\n"
-        "Assistant: I don’t have our address in view here. I can share it by email or connect you with the team—would you like that?\n\n"
-        "Example 4\n"
+        "If helpful, I can outline an approach for your use case.\n\n"
+        "Example C\n"
         "User: how much does it cost?\n"
-        "[Pricing] Overview: Pricing depends on scope; short discovery call, then a clear quote.\n"
-        "Assistant: Pricing depends on scope. We usually start with a short discovery call and then share a clear quote. "
+        "[Pricing] Overview: Depends on scope; short discovery call, then a clear quote.\n"
+        "Assistant: Pricing depends on scope. We usually start with a short discovery call, then share a clear quote. "
         "If helpful, I can note a contact so the team can follow up.\n\n"
+        "Example D\n"
+        "User: what’s your address?\n"
+        "[Retrieved] (empty)\n"
+        "Assistant: I don’t have our address in view here. I can share it via our contact page or by email if you’d like.\n\n"
     )
+
+    # Pass intent explicitly (don’t rely on the model to “find it” in prose)
+    intent_line = f"kind={intent_kind or 'other'}; topic={intent_topic or 'None'}"
 
     user = (
         f"{shots}"
+        f"[Intent]\n{intent_line}\n\n"
         f"User: {user_text}\n\n"
         f"[Summary]\n{summary or 'None'}\n\n"
         f"[Current topic]\n{current_topic or 'None'}\n\n"
@@ -192,12 +194,9 @@ def _final_answer(
         f"[Company contact]\n{contact_ctx or 'None'}\n\n"
         f"[Pricing]\n{pricing_ctx or 'None'}\n\n"
         f"[Retrieved]\n{retrieved_snippets or 'None'}\n\n"
-        f"[Lead hint]\n{lead_hint or 'None'}\n\n"
-        f"[last_asked]\n{last_asked or 'None'}\n\n"
         "Now reply as Corah following the rules above."
     )
     return _chat(model, system, user, temperature=_FINAL_TEMP)
-
 
 # ----------------------------
 # Public: generate_answer
@@ -211,30 +210,27 @@ def generate_answer(
 ) -> Dict[str, Any]:
     """
     Sandwich:
-      1) Planner (route + decide retrieval)
-      2) Retrieval (bounded)
-      3) Final compose
+      1) Use [Intent] from context to guide retrieval.
+      2) Retrieval (bounded).
+      3) Final compose (help-first, KB-first).
     """
     user_text, ctx_block = _split_user_and_ctx(question)
 
-    # Pull structured sections the orchestrator sends
+    # Sections provided by the orchestrator (main.py)
     summary       = _extract_section(ctx_block, "Summary")
     current_topic = _extract_section(ctx_block, "Current topic")
     recent_turns  = _extract_section(ctx_block, "Recent turns")
     user_details  = _extract_section(ctx_block, "User details")
     contact_ctx   = _extract_section(ctx_block, "Company contact")
     pricing_ctx   = _extract_section(ctx_block, "Pricing")
+    intent_kind, intent_topic = _extract_intent(ctx_block)
 
-    bits          = _extract_ctx_bits(ctx_block)
-    lead_hint     = bits.get("lead_hint", "")
-    last_asked    = bits.get("last_asked", "")
+    # Planner (light) + heuristics
+    plan = _planner(user_text, intent_kind=intent_kind, intent_topic=intent_topic)
+    needs_retrieval = bool(plan.get("needs_retrieval", False))
+    search_query = (plan.get("search_query") or user_text).strip()
 
-    # Planner
-    plan = _planner(user_text, lead_hint=lead_hint, current_topic=current_topic)
-    kind = plan.get("kind", "qa")
-    needs_retrieval = bool(plan.get("needs_retrieval", True))
-
-    # If user text obviously contains a fact query, force retrieval (defensive)
+    # Force retrieval if user_text obviously asks for a fact
     low = user_text.lower()
     if any(term in low for term in _FACT_QUERIES):
         needs_retrieval = True
@@ -242,9 +238,8 @@ def generate_answer(
     # Retrieval (bounded)
     hits: List[Dict[str, Any]] = []
     retrieved_snippets = ""
-    if needs_retrieval and kind != "out_of_scope":
+    if needs_retrieval:
         try:
-            search_query = (plan.get("search_query") or user_text).strip()
             raw_hits = search(search_query, k=k)
             pieces: List[str] = []
             total = 0
@@ -256,26 +251,25 @@ def generate_answer(
                 one = f"[{title}] {snippet}"
                 if total + len(one) > max_context_chars:
                     break
-                pieces.append(one)
-                total += len(one)
+                pieces.append(one); total += len(one)
             hits = raw_hits
             retrieved_snippets = "\n\n".join(pieces)
         except Exception:
             hits, retrieved_snippets = [], ""
 
-    # Final answer
+    # Final answer (single, authoritative function)
     answer = _final_answer(
         model=_FINAL_MODEL,
         user_text=user_text,
         retrieved_snippets=retrieved_snippets,
-        user_details=user_details,
-        contact_ctx=contact_ctx,
-        pricing_ctx=pricing_ctx,
         summary=summary,
         current_topic=current_topic,
         recent_turns=recent_turns,
-        lead_hint=lead_hint,
-        last_asked=last_asked,
+        user_details=user_details,
+        contact_ctx=contact_ctx,
+        pricing_ctx=pricing_ctx,
+        intent_kind=intent_kind,
+        intent_topic=intent_topic,
     ).strip()
 
     # Citations (optional)
@@ -294,5 +288,8 @@ def generate_answer(
                 "chunk_no": h.get("chunk_no"),
             })
 
-    dbg = {"planner": plan, "num_hits": len(hits)} if debug else None
+    dbg = {"intent": {"kind": intent_kind, "topic": intent_topic},
+           "needs_retrieval": needs_retrieval,
+           "num_hits": len(hits)} if debug else None
+
     return {"answer": answer, "citations": citations or None, "debug": dbg}
