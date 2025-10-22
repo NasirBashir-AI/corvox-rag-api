@@ -10,7 +10,7 @@ from app.retrieval.sql import SQL_FACTS_SELECT_BY_NAMES
 """
 Thin retrieval facade used by the API and generator.
 
-- search(query, k)      -> top-k hybrid retrieval hits (vector + FTS)
+- search(query, k)      -> top-k hybrid retrieval hits (vector + FTS), with light canonical filtering
 - get_facts(names)      -> structured facts for contact/pricing
 - top_similarity(hits)  -> best score across hits
 - make_context(hits)    -> join hits into a single context string (+ citations)
@@ -23,10 +23,39 @@ def search(query: str, k: Optional[int] = None) -> List[Dict[str, Any]]:
     """
     Return top-k hybrid retrieval hits with a unified shape:
       {document_id, title, source_uri, chunk_id, chunk_no, content, score}
+
+    Adds a small, safe filter so “services” and “pricing/cost” queries prefer
+    canonical docs by title. If filtering would empty results, we fall back
+    to the original list.
     """
     top_k = int(k or RETRIEVAL_TOP_K)
-    return hybrid_retrieve(db_url=DB_URL, query=query, k=top_k)
 
+    # Base retrieval (vector + FTS blend)
+    raw_hits: List[Dict[str, Any]] = hybrid_retrieve(db_url=DB_URL, query=query, k=top_k)
+
+    # Canonical filtering (non-destructive: only narrows when possible)
+    qlow = (query or "").lower()
+    titles = [(h.get("title") or "").lower() for h in raw_hits]
+
+    filtered = raw_hits
+    if "service" in qlow:
+        filt = [
+            h for h in raw_hits
+            if "service" in (h.get("title") or "").lower()
+               or "services" in (h.get("title") or "").lower()
+        ]
+        if filt:  # only narrow if we actually found better-scoped docs
+            filtered = filt
+
+    elif ("pricing" in qlow) or ("price" in qlow) or ("cost" in qlow) or ("budget" in qlow):
+        filt = [
+            h for h in raw_hits
+            if any(token in (h.get("title") or "").lower() for token in ("pricing", "price", "cost"))
+        ]
+        if filt:
+            filtered = filt
+
+    return filtered[:top_k]
 
 # -----------------------------
 # Structured facts (contact/pricing)
@@ -58,7 +87,6 @@ def get_facts(names: Sequence[str], db_url: Optional[str] = None) -> Dict[str, s
             facts[str(n)] = str(v)
     return facts
 
-
 # -----------------------------
 # Compatibility helpers used by generator.py
 # -----------------------------
@@ -67,7 +95,6 @@ def top_similarity(hits: Sequence[Dict[str, Any]]) -> float:
     if not hits:
         return 0.0
     return max(float(h.get("score") or 0.0) for h in hits)
-
 
 def make_context(
     hits: Sequence[Dict[str, Any]],
