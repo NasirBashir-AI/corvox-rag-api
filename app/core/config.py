@@ -1,201 +1,39 @@
-"""
-app/core/config.py
-
-Central configuration for Corah.
-- Reads from environment variables first (so /etc/environment on EC2 wins)
-- Falls back to sensible defaults for local/dev
-- Keep this file self-contained (no imports from other app modules to avoid cycles)
-"""
-
+# app/core/config.py
 from __future__ import annotations
 import os
 
-INACTIVITY_MINUTES = int(os.getenv("CORAH_INACTIVITY_MINUTES", "5"))
-ALLOW_SMALLTALK = True
-CORS_ALLOW_ORIGINS = ["*"]
-HALLUCINATION_GUARD_ON = True
-
-# ---------- helpers ----------
 def _get_bool(name: str, default: bool) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
-
-def _get_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except Exception:
-        return default
+    v = os.getenv(name)
+    if v is None: return default
+    return str(v).strip().lower() in {"1","true","yes","y","on"}
 
 def _get_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except Exception:
-        return default
+    try: return int(os.getenv(name, str(default)))
+    except Exception: return default
 
-def _get_csv_lower(name: str, default_csv: str) -> list[str]:
-    raw = os.getenv(name, default_csv)
-    parts = [p.strip().lower() for p in raw.split(",")]
-    return [p for p in parts if p]
+def _get_float(name: str, default: float) -> float:
+    try: return float(os.getenv(name, str(default)))
+    except Exception: return default
 
-
-# ---------- core services ----------
-# OpenAI API key is read implicitly by the OpenAI SDK:
-#   export OPENAI_API_KEY=sk-...
-# No need to duplicate it here.
-
-# Postgres connection (prefer DB_URL if provided)
-DB_URL = os.getenv(
-    "DB_URL",
-    # local/dev default; override in /etc/environment on EC2 with your RDS URL
-    "postgresql://corah_user:password@127.0.0.1:5432/corah"
-)
-
-# Where raw knowledge files live on the server
-RAW_DOCS_PATH = os.getenv(
-    "RAW_DOCS_PATH",
-    "/home/ec2-user/corah/data/raw"
-)
-
-# Embedding model (used by ingestion and retrieval)
+# Core
+DB_URL = os.getenv("DB_URL", "postgresql://corah_user:password@127.0.0.1:5432/corah")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
+# RAG
+RETRIEVAL_TOP_K = _get_int("RETRIEVAL_TOP_K", 5)
 
-# ---------- Ingestion / chunking ----------
-CHUNK_SIZE    = _get_int("CHUNK_SIZE", 900)
-CHUNK_OVERLAP = _get_int("CHUNK_OVERLAP", 120)
-
-
-# ---------- RAG / Answer generation controls ----------
-# Surface flags (toggleable at runtime via env without code changes)
-SHOW_CITATIONS  = _get_bool("SHOW_CITATIONS", False)   # include lightweight citations in responses
-DEBUG_RAG       = _get_bool("DEBUG_RAG", False)        # include retrieval debug info in API output
-
-# LLM style controls (legacy global)
-TEMPERATURE     = _get_float("TEMPERATURE", 0.5)       # friendly but stable by default
-MAX_TOKENS      = _get_int("MAX_TOKENS", 600)          # cap for completion tokens
-MIN_SIM         = _get_float("MIN_SIM", 0.60)          # similarity threshold (0..1) used for diagnostics
-RETRIEVAL_TOP_K = _get_int("RETRIEVAL_TOP_K", 5)       # default top-k for retrieval when not specified
-
-# Query rewrite / self-querying
-ENABLE_SELF_QUERY = _get_bool("ENABLE_SELF_QUERY", True)
-
-# Router and retrieval feature flags
-ENABLE_SMALLTALK = _get_bool("ENABLE_SMALLTALK", True) # short-circuit greetings/small talk
-ENABLE_HYBRID    = _get_bool("ENABLE_HYBRID", True)    # vector + FTS blending in Postgres
-ENABLE_FACTS     = _get_bool("ENABLE_FACTS", True)     # use structured facts for contact/pricing if available
-
-# Lead capture / reporting
-USE_LLM_LEAD_SUMMARY = _get_bool("USE_LLM_LEAD_SUMMARY", True)
-LEAD_SUMMARY_MODEL   = os.getenv("LEAD_SUMMARY_MODEL", "gpt-4o-mini")
-
-# Nudge/ask controls (already used elsewhere)
-LEAD_NUDGE_COOLDOWN_SEC = _get_int("LEAD_NUDGE_COOLDOWN_SEC", 60)
-LEAD_MAX_NUDGES         = _get_int("LEAD_MAX_NUDGES", 2)
-
-# ---------- NEW: polite, non-pushy conversation knobs ----------
-# How many assistant turns must pass before another CTA is allowed
-CTA_COOLDOWN_TURNS  = _get_int("CTA_COOLDOWN_TURNS", 3)
-# Hard cap on CTA attempts in a single session
-CTA_MAX_ATTEMPTS    = _get_int("CTA_MAX_ATTEMPTS", 2)
-
-# Backchannel words that mean “continue same topic”, not “change topic”
-BACKCHANNEL_KEYWORDS = _get_csv_lower(
-    "BACKCHANNEL_KEYWORDS",
-    "yes, sure, ok, okay, yep, yup, sounds good, go ahead, tell me more, please continue, continue"
-)
-
-# Affirmations that mean “I’m satisfied enough for now”
-AFFIRMATION_KEYWORDS = _get_csv_lower(
-    "AFFIRMATION_KEYWORDS",
-    "got it, makes sense, understood, clear, fine, great, thanks, thank you, cool, perfect, all good"
-)
-
-# ---------- API server defaults (used by run scripts, not FastAPI itself) ----------
-HOST = os.getenv("HOST", "0.0.0.0")
-PORT = _get_int("PORT", 8000)
-
-
-# =========================
-# PHASE 2 ADDITIONS (SAFE)
-# =========================
-
-# 1) Sentiment & intent (enable/disable)
-ENABLE_SENTIMENT = _get_bool("ENABLE_SENTIMENT", True)
-ENABLE_INTENT    = _get_bool("ENABLE_INTENT", True)
-
-# 2) Planner/Final temperatures (keep old TEMPERATURE for legacy paths)
+# Temperatures
 PLANNER_TEMPERATURE = _get_float("PLANNER_TEMPERATURE", 0.3)
 FINAL_TEMPERATURE   = _get_float("FINAL_TEMPERATURE", 0.5)
+TEMPERATURE         = _get_float("TEMPERATURE", 0.5)  # legacy fallback
 
-# 3) One-question-per-turn behaviour
-ONE_QUESTION_MAX = _get_bool("ONE_QUESTION_MAX", True)
+# Conversation policy
+CTA_COOLDOWN_TURNS    = _get_int("CTA_COOLDOWN_TURNS", 3)
+CTA_MAX_ATTEMPTS      = _get_int("CTA_MAX_ATTEMPTS", 2)
+ONE_QUESTION_MAX      = _get_bool("ONE_QUESTION_MAX", True)
+ASK_EARLY             = _get_bool("ASK_EARLY", False)  # if False, don’t ask in first 2 assistant turns
+ASK_MIN_TURN_INDEX    = _get_int("ASK_MIN_TURN_INDEX", 3)  # earliest overall turn to start asking
+ALLOW_PUBLIC_CONTACT  = _get_bool("ALLOW_PUBLIC_CONTACT", True)  # OK to share email/address if retrieved
 
-# 4) Lead capture policy
-REQUIRE_COMPANY            = _get_bool("REQUIRE_COMPANY", True)  # name + company + (email or phone)
-REQUIRE_EMAIL_OR_PHONE     = _get_bool("REQUIRE_EMAIL_OR_PHONE", True)
-ALLOW_CORRECTIONS          = _get_bool("ALLOW_CORRECTIONS", True)
-NO_EMAIL_PROMISE_WITHOUT_CONTACT = _get_bool("NO_EMAIL_PROMISE_WITHOUT_CONTACT", True)
-
-# 5) Recap & confirmation before saving
-RECAP_BEFORE_SAVE = _get_bool("RECAP_BEFORE_SAVE", True)
-
-# 6) End-session behaviour
-END_SESSION_ON_SAVE = _get_bool("END_SESSION_ON_SAVE", True)   # after confirmed save, set end_session=True
-THANKS_GUARD        = _get_bool("THANKS_GUARD", True)          # if user says only "thanks", ask once before closing
-
-# 7) Inactivity timings (minutes)
-INACTIVITY_WARN_MIN  = _get_int("INACTIVITY_WARN_MIN", 5)      # show warning at ~5 min
-INACTIVITY_CLOSE_MIN = _get_int("INACTIVITY_CLOSE_MIN", 6)     # auto-close at ~6 min if no reply
-
-
-# ---------- convenience echo (optional) ----------
-def _mask_db_url(u: str) -> str:
-    if "://" not in u or "@" not in u:
-        return u
-    scheme, rest = u.split("://", 1)
-    if "@" in rest:
-        creds, tail = rest.split("@", 1)
-        return f"{scheme}://***:***@{tail}"
-    return u
-
-if _get_bool("CONFIG_ECHO", False):
-    print("[config] DB_URL=", _mask_db_url(DB_URL), flush=True)
-    print("[config] RAW_DOCS_PATH=", RAW_DOCS_PATH, flush=True)
-    print("[config] EMBEDDING_MODEL=", EMBEDDING_MODEL, flush=True)
-    print("[config] CHUNK_SIZE=", CHUNK_SIZE, flush=True)
-    print("[config] CHUNK_OVERLAP=", CHUNK_OVERLAP, flush=True)
-    print("[config] SHOW_CITATIONS=", SHOW_CITATIONS, flush=True)
-    print("[config] DEBUG_RAG=", DEBUG_RAG, flush=True)
-    print("[config] TEMPERATURE=", TEMPERATURE, flush=True)
-    print("[config] MAX_TOKENS=", MAX_TOKENS, flush=True)
-    print("[config] MIN_SIM=", MIN_SIM, flush=True)
-    print("[config] RETRIEVAL_TOP_K=", RETRIEVAL_TOP_K, flush=True)
-    print("[config] ENABLE_SELF_QUERY=", ENABLE_SELF_QUERY, flush=True)
-    print("[config] ENABLE_SMALLTALK=", ENABLE_SMALLTALK, flush=True)
-    print("[config] ENABLE_HYBRID=", ENABLE_HYBRID, flush=True)
-    print("[config] ENABLE_FACTS=", ENABLE_FACTS, flush=True)
-    print("[config] USE_LLM_LEAD_SUMMARY=", USE_LLM_LEAD_SUMMARY, flush=True)
-    print("[config] LEAD_SUMMARY_MODEL=", LEAD_SUMMARY_MODEL, flush=True)
-    print("[config] LEAD_NUDGE_COOLDOWN_SEC=", LEAD_NUDGE_COOLDOWN_SEC, flush=True)
-    print("[config] LEAD_MAX_NUDGES=", LEAD_MAX_NUDGES, flush=True)
-    print("[config] CTA_COOLDOWN_TURNS=", CTA_COOLDOWN_TURNS, flush=True)
-    print("[config] CTA_MAX_ATTEMPTS=", CTA_MAX_ATTEMPTS, flush=True)
-    print("[config] BACKCHANNEL_KEYWORDS=", BACKCHANNEL_KEYWORDS, flush=True)
-    print("[config] AFFIRMATION_KEYWORDS=", AFFIRMATION_KEYWORDS, flush=True)
-    # Phase 2 echoes
-    print("[config] ENABLE_SENTIMENT=", ENABLE_SENTIMENT, flush=True)
-    print("[config] ENABLE_INTENT=", ENABLE_INTENT, flush=True)
-    print("[config] PLANNER_TEMPERATURE=", PLANNER_TEMPERATURE, flush=True)
-    print("[config] FINAL_TEMPERATURE=", FINAL_TEMPERATURE, flush=True)
-    print("[config] ONE_QUESTION_MAX=", ONE_QUESTION_MAX, flush=True)
-    print("[config] REQUIRE_COMPANY=", REQUIRE_COMPANY, flush=True)
-    print("[config] REQUIRE_EMAIL_OR_PHONE=", REQUIRE_EMAIL_OR_PHONE, flush=True)
-    print("[config] ALLOW_CORRECTIONS=", ALLOW_CORRECTIONS, flush=True)
-    print("[config] NO_EMAIL_PROMISE_WITHOUT_CONTACT=", NO_EMAIL_PROMISE_WITHOUT_CONTACT, flush=True)
-    print("[config] RECAP_BEFORE_SAVE=", RECAP_BEFORE_SAVE, flush=True)
-    print("[config] END_SESSION_ON_SAVE=", END_SESSION_ON_SAVE, flush=True)
-    print("[config] THANKS_GUARD=", THANKS_GUARD, flush=True)
-    print("[config] INACTIVITY_WARN_MIN=", INACTIVITY_WARN_MIN, flush=True)
-    print("[config] INACTIVITY_CLOSE_MIN=", INACTIVITY_CLOSE_MIN, flush=True)
+# Inactivity (frontend hints only; backend may use separately)
+INACTIVITY_MINUTES = _get_int("CORAH_INACTIVITY_MINUTES", 5)

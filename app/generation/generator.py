@@ -1,45 +1,28 @@
 # app/generation/generator.py
 from __future__ import annotations
-
-import os
-import json
-import re
+import os, json, re
 from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 from app.core.utils import normalize_ws
-from app.retrieval.retriever import search
+from app.retrieval.retriever import search, get_facts
+from app.core.config import PLANNER_TEMPERATURE, FINAL_TEMPERATURE, ALLOW_PUBLIC_CONTACT
 
-# ----------------------------
-# Models & Temperatures
-# ----------------------------
 _PLANNER_MODEL = os.getenv("OPENAI_PLANNER_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 _FINAL_MODEL   = os.getenv("OPENAI_FINAL_MODEL",   os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 
-# Separate planner/final temps; fall back to legacy TEMPERATURE
-_LEGACY_TEMP   = float(os.getenv("TEMPERATURE", "0.5"))
-_PLANNER_TEMP  = float(os.getenv("PLANNER_TEMPERATURE", os.getenv("PLANNER_TEMP", "0.3")))
-_FINAL_TEMP    = float(os.getenv("FINAL_TEMPERATURE",   os.getenv("FINAL_TEMP",   str(_LEGACY_TEMP))))
-
 _client = OpenAI()
-client = _client  # exported compatibility
+client = _client
 
-# ----------------------------
-# Context markers & regex
-# ----------------------------
 _CTX_START = "[Context]"
 _CTX_END   = "[End Context]"
 
-# Obvious “company fact” queries that should force retrieval
 _FACT_QUERIES = [
-    "address", "where are you based", "where are you located", "location",
-    "services", "what services", "pricing", "price", "cost", "how much",
-    "contact", "email", "phone", "number", "website", "url"
+    "address","where are you based","where are you located","location",
+    "services","what services","pricing","price","cost","how much",
+    "contact","email","phone","number","website","url"
 ]
 
-# ----------------------------
-# Helpers: context parsing
-# ----------------------------
 def _split_user_and_ctx(q: str) -> Tuple[str, str]:
     if _CTX_START in q and _CTX_END in q:
         head, rest = q.split(_CTX_START, 1)
@@ -48,83 +31,52 @@ def _split_user_and_ctx(q: str) -> Tuple[str, str]:
     return q.strip(), ""
 
 def _extract_section(ctx_block: str, header: str) -> str:
-    """
-    Extracts a dash-led section from the [Context] block, e.g.
-      - Summary: ...
-      - Recent turns:
-        <lines>
-    Returns the raw text for that section (may span multiple lines until the next "- <Header>:").
-    """
-    if not ctx_block:
-        return ""
-    # Find the start line for this header (dash style)
+    if not ctx_block: return ""
     start_pat = re.compile(rf"^\s*-\s*{re.escape(header)}\s*:\s*(.*)$", re.IGNORECASE | re.MULTILINE)
     m = start_pat.search(ctx_block)
-    if not m:
-        return ""
-    start_idx = m.end(0)
-    tail = ctx_block[start_idx:]
+    if not m: return ""
+    start_idx = m.end(0); tail = ctx_block[start_idx:]
     nxt = re.search(r"^\s*-\s*[A-Za-z].*?:", tail, re.MULTILINE)
     chunk = tail[:nxt.start()] if nxt else tail
-    text = (m.group(1) + "\n" + chunk).strip()
-    return "\n".join(line.rstrip() for line in text.splitlines()).strip()
+    txt = (m.group(1) + "\n" + chunk).strip()
+    return "\n".join(line.rstrip() for line in txt.splitlines()).strip()
 
-def _extract_intent(ctx_block: str) -> Tuple[str, Optional[str]]:
-    """
-    Parse the [Intent] mini-block injected by main.py:
-      [Intent]
-      kind: info
-      topic: services
-    Returns (kind, topic_or_None)
-    """
-    if not ctx_block:
-        return "other", None
-    m_kind  = re.search(r"^\s*kind\s*:\s*([A-Za-z_]+)\s*$",  ctx_block, re.IGNORECASE | re.MULTILINE)
-    m_topic = re.search(r"^\s*topic\s*:\s*([A-Za-z_]+)\s*$", ctx_block, re.IGNORECASE | re.MULTILINE)
-    kind  = (m_kind.group(1).strip().lower()  if m_kind  else "other")
+def _extract_intent(ctx_block: str) -> Tuple[str, Optional[str], bool]:
+    if not ctx_block: return "other", None, False
+    m_kind  = re.search(r"^\s*kind\s*:\s*([A-Za-z_]+)\s*$",   ctx_block, re.IGNORECASE | re.MULTILINE)
+    m_topic = re.search(r"^\s*topic\s*:\s*([A-Za-z_]+)\s*$",  ctx_block, re.IGNORECASE | re.MULTILINE)
+    m_ask   = re.search(r"^\s*ask_ok\s*:\s*(true|false)\s*$", ctx_block, re.IGNORECASE | re.MULTILINE)
+    kind = (m_kind.group(1).strip().lower() if m_kind else "other")
     topic = (m_topic.group(1).strip().lower() if m_topic else None)
-    if topic in ("none", ""):
-        topic = None
-    return kind, topic
+    ask_ok = (m_ask and m_ask.group(1).lower() == "true")
+    if topic in ("none",""): topic = None
+    return kind, topic, ask_ok
 
 def _chat(model: str, system: str, user: str, temperature: float) -> str:
     resp = _client.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
+        model=model, temperature=temperature,
+        messages=[{"role":"system","content":system},{"role":"user","content":user}],
     )
     return (resp.choices[0].message.content or "").strip()
 
-# ----------------------------
-# Planner — lightweight/defensive
-# ----------------------------
 def _planner(user_text: str, intent_kind: str, intent_topic: Optional[str]) -> Dict[str, Any]:
-    """
-    Small planner to decide retrieval.
-    If intent says info/contact/pricing -> retrieval = true; else rely on heuristics.
-    """
-    needs = intent_kind in ("info", "contact") or (intent_kind == "info" and intent_topic in ("pricing", "services"))
+    needs = intent_kind in ("info","contact") or (intent_kind=="info" and intent_topic in ("pricing","services"))
     system = (
-        "Return ONLY JSON with keys: {needs_retrieval:boolean, search_query:string|null}\n"
-        "- If the user is asking for company facts (address/location/services/pricing/contact), needs_retrieval=true.\n"
-        "- Otherwise false. search_query should usually be the user text."
+        "Return ONLY JSON: {needs_retrieval:boolean, search_query:string|null}\n"
+        "- If the user asks for company facts (address/location/services/pricing/contact), needs_retrieval=true."
     )
-    user = f"User text:\n{user_text}\n\nHeuristic needs_retrieval (pre): {str(needs).lower()}"
-    raw = _chat(_PLANNER_MODEL, system, user, temperature=_PLANNER_TEMP)
+    user = f"User:\n{user_text}\nHeuristic needs={str(needs).lower()}"
+    raw = _chat(_PLANNER_MODEL, system, user, temperature=PLANNER_TEMPERATURE)
     out = {"needs_retrieval": needs, "search_query": user_text}
     try:
         obj = json.loads(raw)
         if isinstance(obj, dict):
             out["needs_retrieval"] = bool(obj.get("needs_retrieval", needs))
-            out["search_query"]    = (obj.get("search_query") or user_text)
+            out["search_query"] = (obj.get("search_query") or user_text)
     except Exception:
         pass
     return out
 
-# ----------------------------
-# Final answer composer (single authoritative version)
-# ----------------------------
 def _final_answer(
     model: str,
     user_text: str,
@@ -137,58 +89,31 @@ def _final_answer(
     pricing_ctx: str,
     intent_kind: str,
     intent_topic: Optional[str],
+    ask_ok: bool,
 ) -> str:
+    allow_public = "YES" if ALLOW_PUBLIC_CONTACT else "NO"
     system = (
-        "You are Corah, Corvox’s professional front-desk assistant — helpful first, concise, factual.\n"
-        "CRITICAL RULES:\n"
-        "1) Answer the user first, grounded in [Retrieved] when available.\n"
+        "You are Corah, Corvox’s front-desk assistant—help-first, concise, factual.\n"
+        "Rules:\n"
+        "1) Answer the user’s question FIRST using [Retrieved] when available.\n"
         "2) Keep replies short (1–3 sentences). Avoid filler and repetition.\n"
-        "3) Never invent company facts (address/location/services/pricing/contact).\n"
-        "4) If a public contact detail (email, office address, website URL) is explicitly present in [Retrieved]\n"
-        "   or [Company contact], you may share it verbatim. If not present, say you don’t have it in view and\n"
-        "   offer the contact page or a follow-up option.\n"
-        "5) If a user name exists in [User details], use it naturally once (e.g., “Thanks, Nasir”).\n"
-        "6) Ask at most one short follow-up question only if it clearly advances the goal.\n"
-        "7) If the question is off-domain (e.g., cooking/singing), politely redirect to what you can help with\n"
-        "   (overview of services or pricing) instead of generic advice.\n"
-        "8) For services/pricing when details are thin, provide the concise default lines from [Defaults].\n"
+        "3) Never invent company facts. If the detail isn’t present, say you don’t have it in view and offer a next step.\n"
+        f"4) Contact details policy (ALLOW_PUBLIC_CONTACT={allow_public}): If a public email, office address, or website URL is explicitly present in "
+        "[Retrieved] or [Company contact] and policy is YES, you MAY share it verbatim once. Otherwise don’t invent it.\n"
+        "5) Ask at most ONE short follow-up question only if ask_ok=true. If ask_ok=false, do NOT ask a question.\n"
+        "6) If unrelated to Corvox/AI, politely redirect back to services/pricing.\n"
+        "7) Use the person’s name from [User details] naturally once if known.\n"
+        "8) Never repeat the same ask in consecutive turns (assume the orchestrator passes last_asked).\n"
     )
-
     shots = (
-        "Example A\n"
-        "User: where are you based?\n"
-        "[Retrieved] Luton, UK\n"
-        "Assistant: We’re based in Luton, UK. If you need anything else, I can point you to the contact page.\n\n"
-        "Example B\n"
-        "User: what services do you provide?\n"
-        "[Retrieved] Custom chat & voice agents for support, FAQs, and product guidance.\n"
-        "Assistant: We build custom chat and voice agents—covering support, FAQs, and guided recommendations. "
-        "If helpful, I can outline an approach for your use case.\n\n"
-        "Example C\n"
-        "User: how much does it cost?\n"
-        "[Pricing] Overview: Depends on scope; short discovery call, then a clear quote.\n"
-        "Assistant: Pricing depends on scope. We usually start with a short discovery call, then share a clear quote. "
-        "If helpful, I can note a contact so the team can follow up.\n\n"
-        "Example D\n"
-        "User: what’s your address?\n"
-        "[Retrieved] Suite 303, Quantrill House, 2 Dunstable Road, Luton, LU1 1DX\n"
-        "Assistant: Our office is Suite 303, Quantrill House, 2 Dunstable Road, Luton LU1 1DX.\n\n"
+        "Example (contact present)\n"
+        "User: what's your email?\n"
+        "[Retrieved] info@corvox.co.uk\n"
+        "Assistant: Our email is info@corvox.co.uk. If helpful, I can outline next steps.\n\n"
     )
-
-    defaults = (
-        "[Defaults]\n"
-        "Services default: We build custom AI chat and voice agents that automate customer support, lead handling, and guided help.\n"
-        "Pricing default: Pricing depends on scope; we start with a short discovery call and then share a clear quote.\n"
-        "Off-domain redirect: I’m best with Corvox’s AI services—would you like a quick overview or pricing info?\n"
-    )
-
-    # Intent line (explicit)
-    intent_line = f"kind={intent_kind or 'other'}; topic={intent_topic or 'None'}"
-
     user = (
         f"{shots}"
-        f"{defaults}\n"
-        f"[Intent]\n{intent_line}\n\n"
+        f"[Intent] kind={intent_kind or 'other'}; topic={intent_topic or 'None'}; ask_ok={str(bool(ask_ok)).lower()}\n\n"
         f"User: {user_text}\n\n"
         f"[Summary]\n{summary or 'None'}\n\n"
         f"[Current topic]\n{current_topic or 'None'}\n\n"
@@ -197,13 +122,10 @@ def _final_answer(
         f"[Company contact]\n{contact_ctx or 'None'}\n\n"
         f"[Pricing]\n{pricing_ctx or 'None'}\n\n"
         f"[Retrieved]\n{retrieved_snippets or 'None'}\n\n"
-        "Now reply as Corah following the rules above."
+        "Reply as Corah following the rules above."
     )
-    return _chat(model, system, user, temperature=_FINAL_TEMP)
+    return _chat(model, system, user, temperature=FINAL_TEMPERATURE)
 
-# ----------------------------
-# Public: generate_answer
-# ----------------------------
 def generate_answer(
     question: str,
     k: int = 5,
@@ -211,57 +133,43 @@ def generate_answer(
     debug: Optional[bool] = False,
     show_citations: Optional[bool] = False,
 ) -> Dict[str, Any]:
-    """
-    Sandwich:
-      1) Use [Intent] from context to guide retrieval.
-      2) Retrieval (bounded).
-      3) Final compose (help-first, KB-first).
-    """
     user_text, ctx_block = _split_user_and_ctx(question)
 
-    # Sections provided by the orchestrator (main.py)
     summary       = _extract_section(ctx_block, "Summary")
     current_topic = _extract_section(ctx_block, "Current topic")
     recent_turns  = _extract_section(ctx_block, "Recent turns")
     user_details  = _extract_section(ctx_block, "User details")
     contact_ctx   = _extract_section(ctx_block, "Company contact")
     pricing_ctx   = _extract_section(ctx_block, "Pricing")
-    intent_kind, intent_topic = _extract_intent(ctx_block)
 
-    # Planner (light) + heuristics
+    intent_kind, intent_topic, ask_ok = _extract_intent(ctx_block)
+
     plan = _planner(user_text, intent_kind=intent_kind, intent_topic=intent_topic)
     needs_retrieval = bool(plan.get("needs_retrieval", False))
     search_query = (plan.get("search_query") or user_text).strip()
 
-    # Force retrieval if user_text obviously asks for a fact
     low = user_text.lower()
     if any(term in low for term in _FACT_QUERIES):
         needs_retrieval = True
 
-    # Retrieval (bounded)
     hits: List[Dict[str, Any]] = []
     retrieved_snippets = ""
     if needs_retrieval:
         try:
             raw_hits = search(search_query, k=k)
-            pieces: List[str] = []
-            total = 0
+            pieces: List[str] = []; total = 0
             for h in raw_hits:
-                snippet = normalize_ws(h.get("content", "")).strip()
+                snippet = normalize_ws(h.get("content","")).strip()
                 title = (h.get("title") or "")[:120]
-                if not snippet:
-                    continue
+                if not snippet: continue
                 one = f"[{title}] {snippet}"
-                if total + len(one) > max_context_chars:
-                    break
-                pieces.append(one)
-                total += len(one)
+                if total + len(one) > max_context_chars: break
+                pieces.append(one); total += len(one)
             hits = raw_hits
             retrieved_snippets = "\n\n".join(pieces)
         except Exception:
             hits, retrieved_snippets = [], ""
 
-    # Final answer (single, authoritative function)
     answer = _final_answer(
         model=_FINAL_MODEL,
         user_text=user_text,
@@ -274,16 +182,15 @@ def generate_answer(
         pricing_ctx=pricing_ctx,
         intent_kind=intent_kind,
         intent_topic=intent_topic,
+        ask_ok=ask_ok,
     ).strip()
 
-    # Citations (optional)
     citations: List[Dict[str, Any]] = []
     if show_citations and hits:
         seen = set()
         for h in hits:
             key = (h.get("title"), h.get("source_uri"))
-            if key in seen:
-                continue
+            if key in seen: continue
             seen.add(key)
             citations.append({
                 "title": h.get("title"),
@@ -292,11 +199,7 @@ def generate_answer(
                 "chunk_no": h.get("chunk_no"),
             })
 
-    dbg = (
-        {"intent": {"kind": intent_kind, "topic": intent_topic},
-         "needs_retrieval": needs_retrieval,
-         "num_hits": len(hits)}
-        if debug else None
-    )
+    dbg = {"intent": {"kind": intent_kind, "topic": intent_topic, "ask_ok": ask_ok},
+           "needs_retrieval": needs_retrieval, "num_hits": len(hits)} if debug else None
 
     return {"answer": answer, "citations": citations or None, "debug": dbg}
