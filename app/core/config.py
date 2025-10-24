@@ -1,6 +1,7 @@
 # app/lead/capture.py
 from __future__ import annotations
 import re
+import os
 from typing import Dict
 from app.core.session_mem import get_lead_slots, update_lead_slot
 
@@ -9,6 +10,15 @@ _PHONE_RE = re.compile(r"\b(?:\+?\d[\s\-()]*){7,}\d\b")
 _NAME_RE  = re.compile(r"\b(?:my\s+name\s+is|i\s*'?m|i\s+am|this\s+is)\s+([A-Z][A-Za-z'.\- ]{1,60})\b", re.IGNORECASE)
 _COMPANY_RE = re.compile(r"\b(?:company|business|organisation|organization)\s*(?:name|called|is)?\s*([A-Z][\w&'.\- ]{1,80})\b", re.IGNORECASE)
 _TIME_RE = re.compile(r"\b(?:tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}[:.]\d{2}\s*(am|pm))\b", re.IGNORECASE)
+
+# Default top-k for retrieval when not specified
+RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "5"))
+
+DB_URL = os.getenv(
+    "DB_URL",
+    "postgresql://corah_user:password@127.0.0.1:5432/corah"
+)
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
 def extract_lead_fields(text: str) -> Dict[str, str]:
     lead: Dict[str, str] = {}
