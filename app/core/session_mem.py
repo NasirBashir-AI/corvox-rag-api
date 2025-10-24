@@ -85,3 +85,18 @@ def cleanup_expired() -> None:
             ts = now
         if ts < cutoff:
             _SESSIONS.pop(sid, None)
+
+# --- Session closing helpers ---
+
+def mark_closed(session_id: str):
+    """Mark a session as closed so no further chat is accepted."""
+    st = _load(session_id)
+    if st is None:
+        st = {}
+    st["closed"] = True
+    _save(session_id, st)
+
+def is_session_closed(session_id: str) -> bool:
+    """Check if the session has been closed."""
+    st = _load(session_id)
+    return bool(st and st.get("closed"))
