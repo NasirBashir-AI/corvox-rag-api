@@ -1,3 +1,9 @@
+# app/core/session_mem.py
+"""
+Lightweight in-memory session manager for Corah.
+Persists turns, quick summary, and lead slots.
+"""
+
 from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
@@ -5,7 +11,6 @@ from typing import Dict, Any, List, Optional
 _SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 TURN_MEMORY_LIMIT = 10
-CTA_COOLDOWN_TURNS = 2
 SESSION_TTL_MINUTES = 30
 
 def _now_iso() -> str:
@@ -44,19 +49,13 @@ def update_summary(session_id: str) -> None:
     last_user = next((t["content"] for t in reversed(turns) if t.get("role") == "user"), "")
     quick = (last_user[:150] + "...") if last_user and len(last_user) > 150 else (last_user or "-")
     st["summary"] = quick
-    st["session_summary"] = quick
-    st["current_topic"] = st.get("current_topic") or "general"
     st["updated_at"] = _now_iso()
 
 def get_lead_slots(session_id: str) -> Dict[str, Any]:
     st = _SESSIONS.setdefault(session_id, {})
     return st.setdefault("lead", {
-        "name": None,
-        "company": None,
-        "email": None,
-        "phone": None,
-        "preferred_time": None,
-        "notes": None,
+        "name": None, "company": None, "email": None,
+        "phone": None, "preferred_time": None, "notes": None,
     })
 
 def update_lead_slot(session_id: str, field: str, value: Optional[str]) -> None:
@@ -68,39 +67,6 @@ def update_lead_slot(session_id: str, field: str, value: Optional[str]) -> None:
             lead[field] = v
             st["last_slot_updated"] = field
             st["updated_at"] = _now_iso()
-
-def all_lead_info_complete(session_id: str) -> bool:
-    lead = get_lead_slots(session_id)
-    required = ["name", "company"]
-    has_contact = bool(lead.get("email") or lead.get("phone"))
-    return all(lead.get(f) for f in required) and has_contact
-
-def can_offer_cta(session_id: str) -> bool:
-    st = _SESSIONS.get(session_id, {})
-    turns_since = (st.get("turns_count", 0) - st.get("cta_last_turn", 0))
-    return turns_since >= CTA_COOLDOWN_TURNS
-
-def mark_cta_used(session_id: str) -> None:
-    st = _SESSIONS.setdefault(session_id, {})
-    st["cta_last_turn"] = st.get("turns_count", 0)
-    st["cta_attempts"] = st.get("cta_attempts", 0) + 1
-    st["updated_at"] = _now_iso()
-
-def reset_cta_cooldown(session_id: str) -> None:
-    st = _SESSIONS.setdefault(session_id, {})
-    st["cta_last_turn"] = 0
-    st["cta_attempts"] = 0
-    st["updated_at"] = _now_iso()
-
-def mark_closed(session_id: str) -> None:
-    st = _SESSIONS.setdefault(session_id, {})
-    st["closed_at"] = _now_iso()
-    st["is_closed"] = True
-    st["updated_at"] = _now_iso()
-
-def is_session_closed(session_id: str) -> bool:
-    st = _SESSIONS.get(session_id, {})
-    return bool(st.get("is_closed"))
 
 def cleanup_expired() -> None:
     now = datetime.now(timezone.utc)

@@ -1,3 +1,14 @@
+# app/api/main.py
+"""
+FastAPI entrypoint for Corah.
+
+Endpoints
+- GET  /api/health
+- GET  /api/search
+- GET  /api/ping
+- POST /api/chat
+"""
+
 from __future__ import annotations
 from typing import List
 from datetime import datetime, timezone
@@ -14,10 +25,12 @@ from app.retrieval.retriever import search, get_facts
 from app.generation.generator import generate_answer
 from app.core.session_mem import (
     get_state, set_state, append_turn, recent_turns, update_summary,
-    get_lead_slots, update_lead_slot, can_offer_cta, mark_cta_used,
+    get_lead_slots,
 )
 from app.api.intents import detect_intent, smalltalk_reply
 from app.lead.capture import update_lead_info
+
+# -------------------------------------------------------------------
 
 app = FastAPI(
     title="Corah API",
@@ -80,7 +93,7 @@ def api_ping(session_id: str = Query(..., min_length=1)) -> dict:
     return {"ok": True}
 
 # -------------------------------------------------------------------
-# Chat orchestration
+# Chat orchestration (lean controller)
 
 @app.post("/api/chat", response_model=ChatResponse)
 def api_chat(req: ChatRequest) -> ChatResponse:
@@ -93,21 +106,22 @@ def api_chat(req: ChatRequest) -> ChatResponse:
 
     q = normalize_ws(q_raw)
 
+    # Ensure session shell
     st = get_state(session_id) or {}
     if not st:
-        st = {"created_at": _now_iso(), "summary": "", "turns": [], "cta_last_turn": 0}
+        st = {"created_at": _now_iso(), "summary": "", "turns": []}
         set_state(session_id, **st)
 
-    # record user turn
+    # Record user turn
     append_turn(session_id, role="user", content=q)
 
-    # opportunistic lead extraction (does NOT ask anything)
-    slots = update_lead_info(session_id, q)  # extracts name/email/phone/company/time if present
+    # Opportunistic lead extraction (name/email/phone/time/company)
+    update_lead_info(session_id, q)
 
-    # intent routing
+    # Intent routing
     kind, topic = detect_intent(q)
 
-    # smalltalk is answered immediately
+    # Smalltalk: immediate reply, then update summary
     if kind == "smalltalk":
         answer = smalltalk_reply(q)
         append_turn(session_id, role="assistant", content=answer)
@@ -117,32 +131,38 @@ def api_chat(req: ChatRequest) -> ChatResponse:
             pass
         return ChatResponse(answer=answer, citations=None, debug=None)
 
-    # build context sections
+    # Build [User details] from lead slots
+    slots = get_lead_slots(session_id)
+    user_details_txt = "\n".join(
+        f"{k}: {v}" for k, v in (
+            ("name", slots.get("name")),
+            ("company", slots.get("company")),
+            ("email", slots.get("email")),
+            ("phone", slots.get("phone")),
+            ("preferred_time", slots.get("preferred_time") or slots.get("time")),
+        ) if v
+    )
+
+    # Pull company contact/pricing facts (if any)
+    facts = get_facts(["contact_email", "office_address", "contact_url", "pricing_overview"])
+    contact_ctx = "\n".join(
+        f"{k}: {v}" for k, v in (
+            ("email", facts.get("contact_email")),
+            ("office_address", facts.get("office_address")),
+            ("contact_url", facts.get("contact_url")),
+        ) if v
+    )
+    pricing_ctx = facts.get("pricing_overview", "") or "Pricing depends on scope; we start with a short discovery call, then share a clear quote."
+
+    # Recent info
     st2 = get_state(session_id) or st
     summary_txt = st2.get("summary", "")
-    last_turns = recent_turns(session_id, n=8)
+    last_turns = recent_turns(session_id, n=6)
 
-    # user details block
-    lead = get_lead_slots(session_id)
-    user_details = []
-    for k in ("name", "company", "email", "phone", "preferred_time"):
-        v = lead.get(k)
-        if v:
-            user_details.append(f"{k}: {v}")
-    user_details_txt = "\n".join(user_details)
-
-    # structured facts for contact/pricing (optional)
-    facts = get_facts(["contact_email", "office_address", "contact_url"])
-    contact_ctx = "\n".join([f"{k}: {v}" for k, v in facts.items() if v]) or ""
-    pricing_ctx = "Pricing depends on scope; we start with a short discovery call then share a clear quote."
-
-    # one-question policy knob: “answer-only until intent”
-    answer_only_until_intent = True  # hard on: do not ask ANY question unless intent is lead/pricing/contact
-
+    # Compose the context block (explicit Intent)
     context_block = (
         "[Context]\n"
         f"- Summary: {summary_txt or 'None'}\n"
-        f"- Current topic: {st2.get('current_topic','') or 'None'}\n"
         f"- Recent turns:\n" + "\n".join(
             f"  - {t.get('role','?')}: {t.get('content','')}" for t in last_turns
         ) + "\n"
@@ -152,16 +172,15 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         "[Intent]\n"
         f"kind: {kind}\n"
         f"topic: {topic or 'None'}\n"
-        f"policy.answer_only_until_intent: {str(answer_only_until_intent).lower()}\n"
         "[End Context]\n"
     )
 
-    # call generator
+    # Ask the generator (KB-first, answer-first)
     try:
         gen = generate_answer(
             question=f"{q}\n\n{context_block}",
             k=RETRIEVAL_TOP_K,
-            max_context_chars=3200,
+            max_context_chars=3000,
             debug=False,
             show_citations=True,
         )
@@ -173,15 +192,9 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     citations = gen.get("citations") or None
     dbg = gen.get("debug") or None
 
-    # record assistant turn
     append_turn(session_id, role="assistant", content=answer_text)
-
-    # update quick summary + topic memory
     try:
         update_summary(session_id)
-        # remember current topic based on intent if useful
-        if kind in ("info", "pricing", "services", "contact", "lead"):
-            set_state(session_id, current_topic=(topic or kind))
     except Exception:
         pass
 

@@ -1,12 +1,10 @@
+# app/generation/generator.py
 from __future__ import annotations
 
 import os, json, re
 from typing import Any, Dict, List, Optional, Tuple
-
 from openai import OpenAI
 from app.core.utils import normalize_ws
-
-# retrieval surface
 from app.retrieval.retriever import search
 
 _PLANNER_MODEL = os.getenv("OPENAI_PLANNER_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
@@ -17,14 +15,15 @@ _PLANNER_TEMP  = float(os.getenv("PLANNER_TEMPERATURE", os.getenv("PLANNER_TEMP"
 _FINAL_TEMP    = float(os.getenv("FINAL_TEMPERATURE",   os.getenv("FINAL_TEMP",   str(_LEGACY_TEMP))))
 
 _client = OpenAI()
+client = _client
 
 _CTX_START = "[Context]"
 _CTX_END   = "[End Context]"
 
 _FACT_QUERIES = [
-    "address","where are you based","where are you located","location",
-    "services","what services","pricing","price","cost","how much",
-    "contact","email","phone","number","website","url"
+    "address", "where are you based", "where are you located", "location",
+    "services", "what services", "pricing", "price", "cost", "how much",
+    "contact", "email", "phone", "number", "website", "url",
 ]
 
 def _split_user_and_ctx(q: str) -> Tuple[str, str]:
@@ -35,10 +34,12 @@ def _split_user_and_ctx(q: str) -> Tuple[str, str]:
     return q.strip(), ""
 
 def _extract_section(ctx_block: str, header: str) -> str:
-    if not ctx_block: return ""
+    if not ctx_block:
+        return ""
     start_pat = re.compile(rf"^\s*-\s*{re.escape(header)}\s*:\s*(.*)$", re.IGNORECASE | re.MULTILINE)
     m = start_pat.search(ctx_block)
-    if not m: return ""
+    if not m:
+        return ""
     start_idx = m.end(0)
     tail = ctx_block[start_idx:]
     nxt = re.search(r"^\s*-\s*[A-Za-z].*?:", tail, re.MULTILINE)
@@ -46,17 +47,16 @@ def _extract_section(ctx_block: str, header: str) -> str:
     text = (m.group(1) + "\n" + chunk).strip()
     return "\n".join(line.rstrip() for line in text.splitlines()).strip()
 
-def _extract_intent(ctx_block: str) -> Tuple[str, Optional[str], bool]:
+def _extract_intent(ctx_block: str) -> Tuple[str, Optional[str]]:
     if not ctx_block:
-        return "other", None, True
+        return "other", None
     m_kind = re.search(r"^\s*kind\s*:\s*([A-Za-z_]+)\s*$", ctx_block, re.IGNORECASE | re.MULTILINE)
     m_topic = re.search(r"^\s*topic\s*:\s*([A-Za-z_]+)\s*$", ctx_block, re.IGNORECASE | re.MULTILINE)
-    m_policy = re.search(r"policy\.answer_only_until_intent:\s*(true|false)", ctx_block, re.IGNORECASE)
     kind = (m_kind.group(1).strip().lower() if m_kind else "other")
     topic = (m_topic.group(1).strip().lower() if m_topic else None)
-    if topic in ("none",""): topic = None
-    answer_only_until_intent = True if not m_policy else (m_policy.group(1).lower() == "true")
-    return kind, topic, answer_only_until_intent
+    if topic in ("none", ""):
+        topic = None
+    return kind, topic
 
 def _chat(model: str, system: str, user: str, temperature: float) -> str:
     resp = _client.chat.completions.create(
@@ -68,11 +68,11 @@ def _chat(model: str, system: str, user: str, temperature: float) -> str:
     return (resp.choices[0].message.content or "").strip()
 
 def _planner(user_text: str, intent_kind: str, intent_topic: Optional[str]) -> Dict[str, Any]:
-    needs = intent_kind in ("info","contact") or (intent_kind == "info" and intent_topic in ("pricing","services"))
+    needs = intent_kind in ("info", "contact") or (intent_kind == "info" and intent_topic in ("pricing", "services"))
     system = (
         "Return ONLY JSON: {needs_retrieval:boolean, search_query:string|null}\n"
-        "- If the user asks for company facts (address/location/services/pricing/contact), needs_retrieval=true.\n"
-        "- Otherwise false. search_query is usually the user text."
+        "- If user asks company facts (address/location/services/pricing/contact), needs_retrieval=true.\n"
+        "- search_query defaults to the user text."
     )
     user = f"User text:\n{user_text}\n\nHeuristic needs_retrieval (pre): {str(needs).lower()}"
     raw = _chat(_PLANNER_MODEL, system, user, temperature=_PLANNER_TEMP)
@@ -98,35 +98,30 @@ def _final_answer(
     pricing_ctx: str,
     intent_kind: str,
     intent_topic: Optional[str],
-    answer_only_until_intent: bool,
 ) -> str:
     system = (
         "You are Corah, Corvox’s professional front-desk assistant.\n"
-        "Rules:\n"
-        "- Answer FIRST, concisely, using [Retrieved]/[Company contact]/[Pricing]—no fluff.\n"
-        "- Do NOT ask any follow-up question unless intent is lead/pricing/contact, or the user explicitly asks to book/quote.\n"
-        "- Never repeat the same ask; if a field exists in [User details], don’t ask again.\n"
-        "- Public contact details (email, office address, website URL) may be shared verbatim if present in [Retrieved] or [Company contact].\n"
-        "- Pricing is scope-based: short discovery call → tailored quote. No made-up numbers.\n"
-        "- If out-of-scope, briefly redirect to Corvox services (no question).\n"
-        "- Warm, business-casual tone; 1–3 sentences.\n"
+        "Principles:\n"
+        "• ANSWER-FIRST: answer the user question directly before any ask.\n"
+        "• ONE-ASK policy: only ask a follow-up if there’s clear conversion intent (lead/booking) or essential info is missing.\n"
+        "• NO INVENTION: share company facts ONLY if present in [Retrieved], [Company contact], or [Pricing].\n"
+        "• CONTACT POLICY: If email/office address/URL is present in [Retrieved] or [Company contact], you MAY share it verbatim.\n"
+        "• MEMORY: If [User details] has a name, use it naturally once (e.g., “Thanks, Nasir—…”). Don’t repeat the same ask.\n"
+        "• TONE: concise (1–3 sentences), warm, business-casual. Avoid repeating the same info across turns.\n"
+        "• OUT-OF-SCOPE: politely redirect to Corvox services instead of generic advice.\n"
     )
 
-    shots = (
-        "Ex1\nUser: where are you based?\n[Retrieved] Suite 303, Quantrill House, 2 Dunstable Road, Luton, LU1 1DX\n"
-        "Assistant: We’re based at Suite 303, Quantrill House, 2 Dunstable Road, Luton, LU1 1DX.\n\n"
-        "Ex2\nUser: what services do you provide?\n[Retrieved] Custom chat & voice agents for support, FAQs, guided sales.\n"
-        "Assistant: We build custom AI chat and voice agents for support, FAQs, and guided sales.\n\n"
-        "Ex3\nUser: pricing?\n[Pricing] Depends on scope; discovery call then clear quote.\n"
-        "Assistant: Pricing depends on scope—we start with a short discovery call, then provide a clear quote.\n\n"
-        "Ex4\nUser: can you book a call?\n[User details] name: Nasir; email: nasir@x.com\n"
-        "Assistant: I can line that up—Friday 11am works. I’ll pass your details to the team and confirm by email.\n\n"
+    # crisp defaults for services/pricing if context lacks details
+    fallback_services = (
+        "We build custom AI chat and voice agents (single or multi-agent systems) to automate enquiries, lead capture, and workflow hand-offs."
+    )
+    fallback_pricing = (
+        "Pricing depends on scope; we start with a short discovery call and then share a clear, upfront quote."
     )
 
-    intent_line = f"kind={intent_kind or 'other'}; topic={intent_topic or 'None'}; answer_only_until_intent={str(answer_only_until_intent).lower()}"
+    intent_line = f"kind={intent_kind or 'other'}; topic={intent_topic or 'None'}"
 
     user = (
-        f"{shots}"
         f"[Intent]\n{intent_line}\n\n"
         f"User: {user_text}\n\n"
         f"[Summary]\n{summary or 'None'}\n\n"
@@ -134,9 +129,9 @@ def _final_answer(
         f"[Recent turns]\n{recent_turns or 'None'}\n\n"
         f"[User details]\n{user_details or 'None'}\n\n"
         f"[Company contact]\n{contact_ctx or 'None'}\n\n"
-        f"[Pricing]\n{pricing_ctx or 'None'}\n\n"
+        f"[Pricing]\n{pricing_ctx or fallback_pricing}\n\n"
         f"[Retrieved]\n{retrieved_snippets or 'None'}\n\n"
-        "Reply as Corah now."
+        "Now reply as Corah, following the principles. Prefer answer-only unless the user shows clear lead intent."
     )
     return _chat(model, system, user, temperature=_FINAL_TEMP)
 
@@ -155,7 +150,7 @@ def generate_answer(
     user_details  = _extract_section(ctx_block, "User details")
     contact_ctx   = _extract_section(ctx_block, "Company contact")
     pricing_ctx   = _extract_section(ctx_block, "Pricing")
-    intent_kind, intent_topic, answer_only_until_intent = _extract_intent(ctx_block)
+    intent_kind, intent_topic = _extract_intent(ctx_block)
 
     plan = _planner(user_text, intent_kind=intent_kind, intent_topic=intent_topic)
     needs_retrieval = bool(plan.get("needs_retrieval", False))
@@ -171,19 +166,16 @@ def generate_answer(
         try:
             raw_hits = search(search_query, k=k)
             pieces: List[str] = []
-            used = 0
+            total = 0
             for h in raw_hits:
                 snippet = normalize_ws(h.get("content", "")).strip()
+                title = (h.get("title") or "")[:120]
                 if not snippet:
                     continue
-                title = (h.get("title") or "")[:120]
                 one = f"[{title}] {snippet}"
-                if used + len(one) > max_context_chars:
-                    if not pieces:
-                        pieces.append(one[:max_context_chars-1] + "…")
+                if total + len(one) > max_context_chars:
                     break
-                pieces.append(one)
-                used += len(one)
+                pieces.append(one); total += len(one)
             hits = raw_hits
             retrieved_snippets = "\n\n".join(pieces)
         except Exception:
@@ -201,7 +193,6 @@ def generate_answer(
         pricing_ctx=pricing_ctx,
         intent_kind=intent_kind,
         intent_topic=intent_topic,
-        answer_only_until_intent=answer_only_until_intent,
     ).strip()
 
     citations: List[Dict[str, Any]] = []
@@ -209,7 +200,8 @@ def generate_answer(
         seen = set()
         for h in hits:
             key = (h.get("title"), h.get("source_uri"))
-            if key in seen: continue
+            if key in seen:
+                continue
             seen.add(key)
             citations.append({
                 "title": h.get("title"),

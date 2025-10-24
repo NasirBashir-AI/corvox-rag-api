@@ -1,39 +1,31 @@
-# app/core/config.py
+# app/lead/capture.py
 from __future__ import annotations
-import os
+import re
+from typing import Dict
+from app.core.session_mem import get_lead_slots, update_lead_slot
 
-def _get_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None: return default
-    return str(v).strip().lower() in {"1","true","yes","y","on"}
+_EMAIL_RE = re.compile(r"[\w\.-]+@[\w\.-]+\.\w+", re.IGNORECASE)
+_PHONE_RE = re.compile(r"\b(?:\+?\d[\s\-()]*){7,}\d\b")
+_NAME_RE  = re.compile(r"\b(?:my\s+name\s+is|i\s*'?m|i\s+am|this\s+is)\s+([A-Z][A-Za-z'.\- ]{1,60})\b", re.IGNORECASE)
+_COMPANY_RE = re.compile(r"\b(?:company|business|organisation|organization)\s*(?:name|called|is)?\s*([A-Z][\w&'.\- ]{1,80})\b", re.IGNORECASE)
+_TIME_RE = re.compile(r"\b(?:tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}[:.]\d{2}\s*(am|pm))\b", re.IGNORECASE)
 
-def _get_int(name: str, default: int) -> int:
-    try: return int(os.getenv(name, str(default)))
-    except Exception: return default
+def extract_lead_fields(text: str) -> Dict[str, str]:
+    lead: Dict[str, str] = {}
+    if m := _EMAIL_RE.search(text):   lead["email"] = m.group(0).strip()
+    if m := _PHONE_RE.search(text):   lead["phone"] = m.group(0).strip()
+    if m := _COMPANY_RE.search(text): lead["company"] = m.group(1).strip()
+    if m := _NAME_RE.search(text):
+        possible = m.group(1).strip()
+        lead["name"] = " ".join(w.capitalize() for w in re.split(r"\s+", possible))
+    if m := _TIME_RE.search(text):    lead["preferred_time"] = m.group(0).strip()
+    return lead
 
-def _get_float(name: str, default: float) -> float:
-    try: return float(os.getenv(name, str(default)))
-    except Exception: return default
-
-# Core
-DB_URL = os.getenv("DB_URL", "postgresql://corah_user:password@127.0.0.1:5432/corah")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-
-# RAG
-RETRIEVAL_TOP_K = _get_int("RETRIEVAL_TOP_K", 5)
-
-# Temperatures
-PLANNER_TEMPERATURE = _get_float("PLANNER_TEMPERATURE", 0.3)
-FINAL_TEMPERATURE   = _get_float("FINAL_TEMPERATURE", 0.5)
-TEMPERATURE         = _get_float("TEMPERATURE", 0.5)  # legacy fallback
-
-# Conversation policy
-CTA_COOLDOWN_TURNS    = _get_int("CTA_COOLDOWN_TURNS", 3)
-CTA_MAX_ATTEMPTS      = _get_int("CTA_MAX_ATTEMPTS", 2)
-ONE_QUESTION_MAX      = _get_bool("ONE_QUESTION_MAX", True)
-ASK_EARLY             = _get_bool("ASK_EARLY", False)  # if False, don’t ask in first 2 assistant turns
-ASK_MIN_TURN_INDEX    = _get_int("ASK_MIN_TURN_INDEX", 3)  # earliest overall turn to start asking
-ALLOW_PUBLIC_CONTACT  = _get_bool("ALLOW_PUBLIC_CONTACT", True)  # OK to share email/address if retrieved
-
-# Inactivity (frontend hints only; backend may use separately)
-INACTIVITY_MINUTES = _get_int("CORAH_INACTIVITY_MINUTES", 5)
+def update_lead_info(session_id: str, text: str) -> Dict[str, str]:
+    slots = get_lead_slots(session_id)
+    found = extract_lead_fields(text or "")
+    for k, v in found.items():
+        if v and not slots.get(k):
+            update_lead_slot(session_id, k, v)
+            slots[k] = v
+    return slots
