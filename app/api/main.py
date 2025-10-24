@@ -40,9 +40,15 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
+origins = [
+    "https://app.corvox.co.uk",
+    "https://api.corvox.co.uk",
+    "http://localhost:3000",  # optional for local testing
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
